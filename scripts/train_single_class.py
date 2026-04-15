@@ -64,7 +64,7 @@ def chamfer_l1(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     """
     dist1, dist2, _, _ = _chamfer_fn(pred, gt)
     # L1 版本：取 sqrt 再平均
-    cd = (dist1.sqrt().mean(dim=1) + dist2.sqrt().mean(dim=1)).mean()
+    cd = ((dist1 + 1e-8).sqrt().mean(dim=1) + (dist2 + 1e-8).sqrt().mean(dim=1)).mean()
     return cd
 
 

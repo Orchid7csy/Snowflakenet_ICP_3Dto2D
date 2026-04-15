@@ -39,7 +39,7 @@ _chamfer_fn = chamfer_3DDist()
 
 def chamfer_l1(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     dist1, dist2, _, _ = _chamfer_fn(pred, gt)
-    return (dist1.sqrt().mean(dim=1) + dist2.sqrt().mean(dim=1)).mean()
+    return ((dist1 + 1e-8).sqrt().mean(dim=1) + (dist2 + 1e-8).sqrt().mean(dim=1)).mean()
 
 
 def load_pretrained(model: SnowflakeNet, ckpt_path: str):

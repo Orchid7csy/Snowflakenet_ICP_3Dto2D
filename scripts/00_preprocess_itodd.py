@@ -3,16 +3,15 @@ scripts/00_preprocess_itodd.py
 
 纯 CAD 合成 ITODD completion 训练集生成器。
 
-数据源：28 个 ITODD CAD 模型（ITODD/models/models/obj_*.ply）。
-增强管线（每个 aug_id 内部）：
-  1) 动态微观采样：每次 aug 重新从 mesh 采样 16384 点（不复用上一次的点位）
-  2) 全局 SO(3) 随机旋转
-  3) Fibonacci 球面视角覆盖：生成 num_views 个相机坐标（带 jitter）
-  4) HPR 2.5D 可见性 → depth/specular dropout → 下限保护
-  5) 非均匀深度密度重采样（近密远疏）→ 2048
-  6) bbox 中心化 + PCA 对齐；GT 同步同一变换 → 2048
+五阶段管线对应：
+  阶段一（原点空间）: CAD 采样 → 单位球归一化 → SO(3) → HPR + dropout + 高斯噪声
+  阶段二（观测空间）: 残缺点云 × (R_se3, t_se3) → P_obs（远离原点，模拟真实观测）
+                     完整点云同步变换 → GT_w
+  阶段三（归一化空间）: P_obs → bbox center + scale → PCA → input (P_norm)
+                      GT_w 同步同一 (C_bbox, scale, R_pca, mu_pca) → gt
+  保存: obs(=P_obs), input(=P_norm), gt, meta(含所有逆推参数供 ICP 使用)
 
-train/test 按 (obj_id, aug_id) 级别划分（同一 aug 的所有视角在同一 split）。
+train/test 按 (obj_id, aug_id) 级别划分。
 """
 
 from __future__ import annotations
@@ -21,8 +20,7 @@ import argparse
 import hashlib
 import os
 import sys
-import tempfile
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import open3d as o3d
@@ -36,11 +34,6 @@ from src.data.transforms import apply_depth_dropout, apply_specular_dropout
 
 
 def fibonacci_sphere_cameras(n: int, r: float, jitter: float = 0.0) -> np.ndarray:
-    """
-    在半径 r 的球面上用 Fibonacci 序列均匀放置 n 个相机位置。
-    jitter: 对 phi/theta 的随机扰动幅度（弧度），0 则为纯确定性。
-    返回 (n, 3) float32。
-    """
     golden = (1.0 + np.sqrt(5.0)) / 2.0
     indices = np.arange(n, dtype=np.float64)
     phi = np.arccos(1.0 - 2.0 * (indices + 0.5) / n)
@@ -58,10 +51,6 @@ def fibonacci_sphere_cameras(n: int, r: float, jitter: float = 0.0) -> np.ndarra
 def density_weighted_resample(
     points: np.ndarray, camera_pos: np.ndarray, n: int, alpha: float = 1.5,
 ) -> np.ndarray:
-    """
-    非均匀深度密度重采样：距相机越近的点被选中概率越高，模拟工业 RGBD 近密远疏特性。
-    alpha 越大，近端概率越集中。
-    """
     if points.shape[0] == 0:
         return np.zeros((n, 3), dtype=np.float32)
     d = np.linalg.norm(points - camera_pos[None, :], axis=1)
@@ -72,11 +61,14 @@ def density_weighted_resample(
     return points[idx].astype(np.float32)
 
 
-def normalize_by_bbox(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def normalize_by_bbox(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Center + scale: AABB center, then max-distance = 1."""
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     c = np.asarray(pcd.get_axis_aligned_bounding_box().get_center(), dtype=np.float32)
-    return (points - c[None, :]).astype(np.float32), c
+    centered = (points - c[None, :]).astype(np.float32)
+    scale = float(max(np.linalg.norm(centered, axis=1).max(), 1e-8))
+    return (centered / scale).astype(np.float32), c, scale
 
 
 def _orthonormal_frame(v: np.ndarray) -> np.ndarray:
@@ -162,6 +154,26 @@ def _assign_split(key: str, train_ratio: float, seed: int) -> str:
     return "train" if u < train_ratio else "test"
 
 
+def random_rotation_matrix(max_deg: float = 15.0) -> np.ndarray:
+    rx = np.deg2rad(np.random.uniform(-max_deg, max_deg))
+    ry = np.deg2rad(np.random.uniform(-max_deg, max_deg))
+    rz = np.deg2rad(np.random.uniform(-max_deg, max_deg))
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return (Rz @ Ry @ Rx).astype(np.float32)
+
+
+def random_translation(scale_min: float, scale_max: float, extent: float) -> np.ndarray:
+    mag = np.random.uniform(scale_min, scale_max) * max(extent, 1e-6)
+    d = np.random.randn(3).astype(np.float32)
+    d /= np.linalg.norm(d) + 1e-8
+    return (mag * d).astype(np.float32)
+
+
 # ═══════════════════════════ main ═══════════════════════════
 
 
@@ -182,6 +194,10 @@ def main():
     ap.add_argument("--hpr-radius", type=float, default=100.0)
     ap.add_argument("--fib-jitter", type=float, default=0.15)
     ap.add_argument("--density-alpha", type=float, default=1.5)
+    ap.add_argument("--noise-std", type=float, default=0.002, help="传感器高斯噪声标准差（归一化空间）")
+    ap.add_argument("--se3-rot-max-deg", type=float, default=15.0, help="阶段二 SE3 旋转上界（度）")
+    ap.add_argument("--se3-trans-min", type=float, default=0.5, help="阶段二平移模长系数下限（×extent）")
+    ap.add_argument("--se3-trans-max", type=float, default=2.0, help="阶段二平移模长系数上限（×extent）")
     ap.add_argument("--normal-radius", type=float, default=0.05)
     ap.add_argument("--normal-max-nn", type=int, default=30)
     ap.add_argument("--pca-axis", default="z", choices=("x", "y", "z"))
@@ -212,17 +228,22 @@ def main():
             continue
 
         for aug_id in range(args.num_aug_per_model):
-            # (1) dynamic per-aug sampling
+            # ── 阶段一：原点空间物理退化 ──
+            # (1) 动态微观采样 + 归一化到单位球
             pcd = mesh.sample_points_uniformly(number_of_points=args.num_cad_sample)
             gt_full = np.asarray(pcd.points, dtype=np.float32)
-            gt_full, _ = normalize_by_bbox(gt_full)
+            gt_full, _, _ = normalize_by_bbox(gt_full)
 
-            # (2) global SO(3)
-            R_rand = Rotation.random().as_matrix().astype(np.float32)
-            gt_rot = (gt_full @ R_rand.T).astype(np.float32)
+            # (2) 全局 SO(3)（模拟物体在传送带上的任意朝向）
+            R_aug = Rotation.random().as_matrix().astype(np.float32)
+            gt_rot = (gt_full @ R_aug.T).astype(np.float32)
             n_rot = estimate_normals(gt_rot, radius=args.normal_radius, max_nn=args.normal_max_nn)
 
-            # (3) Fibonacci cameras (per-aug jitter -> different every time)
+            # 计算 extent 用于阶段二平移
+            gt_min, gt_max = gt_rot.min(axis=0), gt_rot.max(axis=0)
+            extent = float(np.max(gt_max - gt_min))
+
+            # (3) Fibonacci 视角（每个 aug 独立 jitter）
             cameras = fibonacci_sphere_cameras(args.num_views, args.hpr_sphere_r, jitter=args.fib_jitter)
 
             # split at (obj, aug) level
@@ -252,28 +273,49 @@ def main():
 
                 cor, cor_n = _ensure_min_points(cor, cor_n, args.min_keep)
 
-                # density-weighted resample -> 2048
-                p_obs = density_weighted_resample(cor, camera_pos, args.num_obs, alpha=args.density_alpha)
+                # 传感器噪声
+                cor = cor + np.random.normal(0, args.noise_std, cor.shape).astype(np.float32)
 
-                # bbox + pca
-                p_norm, C_bbox = normalize_by_bbox(p_obs)
+                # 密度重采样 → 2048 (P_corrupted，仍在原点空间)
+                p_corrupted = density_weighted_resample(cor, camera_pos, args.num_obs, alpha=args.density_alpha)
+
+                # GT 完整点云 2048 (原点空间)
+                gt_2048_origin = resample(gt_rot, args.num_gt)
+
+                # ── 阶段二：随机 SE3 投射到观测空间 ──
+                R_se3 = random_rotation_matrix(args.se3_rot_max_deg)
+                t_se3 = random_translation(args.se3_trans_min, args.se3_trans_max, extent)
+
+                p_obs = (p_corrupted @ R_se3.T + t_se3[None, :]).astype(np.float32)
+                gt_w = (gt_2048_origin @ R_se3.T + t_se3[None, :]).astype(np.float32)
+
+                # ── 阶段三：工程化姿态归一化 ──
+                # bbox center + scale
+                p_norm, C_bbox, scale = normalize_by_bbox(p_obs)
+                # PCA
                 p_in, R_pca, mu_pca = pca_align(p_norm, target_axis=args.pca_axis)
-                gt_sync = (gt_rot - C_bbox[None, :]).astype(np.float32)
-                gt_out = apply_pca_rigid(gt_sync, R_pca, mu_pca)
-                gt_2048 = resample(gt_out, args.num_gt)
+                # GT 同步同一变换
+                gt_norm = ((gt_w - C_bbox[None, :]) / scale).astype(np.float32)
+                gt_out = apply_pca_rigid(gt_norm, R_pca, mu_pca)
 
+                # ── 保存 ──
                 stem = f"obj{obj_id}_aug{aug_id:04d}_v{vi}"
                 sr = os.path.join(out_root, split_name)
                 np.save(os.path.join(sr, "obs", f"{stem}.npy"), p_obs.astype(np.float32))
                 np.save(os.path.join(sr, "input", f"{stem}.npy"), p_in.astype(np.float32))
-                np.save(os.path.join(sr, "gt", f"{stem}.npy"), gt_2048.astype(np.float32))
+                np.save(os.path.join(sr, "gt", f"{stem}.npy"), gt_out.astype(np.float32))
                 np.savez(
                     os.path.join(sr, "meta", f"{stem}.npz"),
-                    C_bbox=C_bbox, R_pca=R_pca, mu_pca=mu_pca,
-                    R_rand=R_rand, camera_pos=camera_pos,
-                    missing_rate=np.float32(mr), n_visible=np.int32(vis_pts.shape[0]),
-                    n_after_removal=np.int32(cor.shape[0]), view_idx=np.int32(vi),
-                    aug_id=np.int32(aug_id), obj_id=np.array([obj_id]),
+                    C_bbox=C_bbox, scale=np.float32(scale),
+                    R_pca=R_pca, mu_pca=mu_pca,
+                    R_se3=R_se3, t_se3=t_se3,
+                    R_aug=R_aug, camera_pos=camera_pos,
+                    missing_rate=np.float32(mr),
+                    n_visible=np.int32(vis_pts.shape[0]),
+                    n_after_removal=np.int32(cor.shape[0]),
+                    view_idx=np.int32(vi),
+                    aug_id=np.int32(aug_id),
+                    obj_id=np.array([obj_id]),
                 )
                 total[split_name] += 1
 

@@ -3,16 +3,16 @@ scripts/01_preprocess_modelnet40.py
 
 ModelNet40 (.off) completion 训练集生成器。
 
-增强管线（与 ITODD 统一）：
-  1) 引入 aug 循环：每个模型生成 num_aug 份样本（类别反向加权平衡）
-  2) 动态微观采样：每次 aug 重新从 mesh 采样 16384 点 + 全局 SO(3) 旋转
-  3) Fibonacci 球面视角覆盖：每次 aug 生成 num_views 个相机（带 jitter）
-  4) HPR 2.5D 可见性 → depth/specular dropout → 下限保护
-  5) 非均匀深度密度重采样（近密远疏）→ 2048
-  6) bbox 中心化 + PCA 对齐；GT 同步同一变换 → 2048
+五阶段管线（与 ITODD 统一）：
+  阶段一（原点空间）: mesh 采样 → 单位球归一化 → SO(3) → HPR + dropout + 高斯噪声
+  阶段二（观测空间）: 残缺点云 × (R_se3, t_se3) → P_obs（模拟真实观测位置）
+                     完整点云同步变换 → GT_w
+  阶段三（归一化空间）: P_obs → bbox center + scale → PCA → input
+                      GT_w 同步同一变换 → gt
+  保存: obs, input, gt, meta(含所有逆推参数)
 
-类别反向加权：统计各类别模型数，类别越少 → num_aug 越大，使最终样本量趋于均衡。
-train/test 划分沿用 ModelNet40 原始目录结构（train/ 或 test/ 子目录）。
+类别反向加权：少数类别 aug 更多，平衡类别不均。
+train/test 沿用 ModelNet40 原始目录（train/ 或 test/）。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import os
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import open3d as o3d
@@ -34,7 +34,6 @@ from src.data.transforms import apply_depth_dropout, apply_specular_dropout
 
 
 # ═══════════════════════════ shared utilities ═══════════════════════════
-# (identical to 00_preprocess_itodd.py for pipeline consistency)
 
 
 def fibonacci_sphere_cameras(n: int, r: float, jitter: float = 0.0) -> np.ndarray:
@@ -65,11 +64,14 @@ def density_weighted_resample(
     return points[idx].astype(np.float32)
 
 
-def normalize_by_bbox(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def normalize_by_bbox(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Center + scale: AABB center, then max-distance = 1."""
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     c = np.asarray(pcd.get_axis_aligned_bounding_box().get_center(), dtype=np.float32)
-    return (points - c[None, :]).astype(np.float32), c
+    centered = (points - c[None, :]).astype(np.float32)
+    scale = float(max(np.linalg.norm(centered, axis=1).max(), 1e-8))
+    return (centered / scale).astype(np.float32), c, scale
 
 
 def _orthonormal_frame(v: np.ndarray) -> np.ndarray:
@@ -160,7 +162,6 @@ def _normalize_point_cloud(pcd: o3d.geometry.PointCloud):
 
 
 def _read_off_mesh(file_path: str) -> o3d.geometry.TriangleMesh:
-    """Read .off with optional header repair."""
     with open(file_path, "rb") as f:
         raw = f.read().decode("utf-8", errors="ignore")
     first_line = raw.split("\n", 1)[0].strip()
@@ -178,13 +179,30 @@ def _read_off_mesh(file_path: str) -> o3d.geometry.TriangleMesh:
     return mesh
 
 
+def random_rotation_matrix(max_deg: float = 15.0) -> np.ndarray:
+    rx = np.deg2rad(np.random.uniform(-max_deg, max_deg))
+    ry = np.deg2rad(np.random.uniform(-max_deg, max_deg))
+    rz = np.deg2rad(np.random.uniform(-max_deg, max_deg))
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return (Rz @ Ry @ Rx).astype(np.float32)
+
+
+def random_translation(scale_min: float, scale_max: float, extent: float) -> np.ndarray:
+    mag = np.random.uniform(scale_min, scale_max) * max(extent, 1e-6)
+    d = np.random.randn(3).astype(np.float32)
+    d /= np.linalg.norm(d) + 1e-8
+    return (mag * d).astype(np.float32)
+
+
 # ═══════════════════════════ scanning & class balancing ═══════════════════════════
 
 
 def _scan_dataset(raw_dir: str):
-    """
-    Return list of (file_path, category, split) and per-split category counts.
-    """
     entries = []
     for root, _, files in os.walk(raw_dir):
         for f in files:
@@ -203,10 +221,6 @@ def _scan_dataset(raw_dir: str):
 
 
 def _compute_aug_counts(entries, base_aug: int, max_aug: int):
-    """
-    Inverse-frequency class balancing per split.
-    Returns dict[(cat, split)] -> num_aug for that category in that split.
-    """
     split_cat_counts: dict[str, Counter] = defaultdict(Counter)
     for _, cat, split in entries:
         split_cat_counts[split][cat] += 1
@@ -225,7 +239,7 @@ def _compute_aug_counts(entries, base_aug: int, max_aug: int):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="ModelNet40 completion 预处理（类别平衡 + 统一增强）")
+    ap = argparse.ArgumentParser(description="ModelNet40 completion 预处理（类别平衡 + 统一增强管线）")
     ap.add_argument("--raw-dir", default="/home/csy/SnowflakeNet_FPFH_ICP/data/raw/ModelNet40")
     ap.add_argument("--out-root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/processed/modelnet40")
     ap.add_argument("--base-aug", type=int, default=1, help="最大类别对应的 aug 次数")
@@ -241,6 +255,10 @@ def main():
     ap.add_argument("--hpr-radius", type=float, default=100.0)
     ap.add_argument("--fib-jitter", type=float, default=0.15)
     ap.add_argument("--density-alpha", type=float, default=1.5)
+    ap.add_argument("--noise-std", type=float, default=0.002)
+    ap.add_argument("--se3-rot-max-deg", type=float, default=15.0)
+    ap.add_argument("--se3-trans-min", type=float, default=0.5)
+    ap.add_argument("--se3-trans-max", type=float, default=2.0)
     ap.add_argument("--normal-radius", type=float, default=0.1)
     ap.add_argument("--normal-max-nn", type=int, default=30)
     ap.add_argument("--pca-axis", default="z", choices=("x", "y", "z"))
@@ -261,7 +279,6 @@ def main():
 
     aug_map = _compute_aug_counts(entries, args.base_aug, args.max_aug)
 
-    # show balance info
     splits_cats = defaultdict(set)
     for _, cat, split in entries:
         splits_cats[split].add(cat)
@@ -288,18 +305,17 @@ def main():
         num_aug = aug_map.get((cat, split), 1)
 
         for aug_id in range(num_aug):
-            # (1) dynamic per-aug sampling + normalize
+            # ── 阶段一：原点空间物理退化 ──
             pcd = mesh.sample_points_uniformly(number_of_points=args.num_cad_sample)
             gt_full, gt_nrm = _normalize_point_cloud(pcd)
 
-            # (2) global SO(3)
-            R_rand = Rotation.random().as_matrix().astype(np.float32)
-            gt_rot = (gt_full @ R_rand.T).astype(np.float32)
-            n_rot = (gt_nrm @ R_rand.T).astype(np.float32)
+            R_aug = Rotation.random().as_matrix().astype(np.float32)
+            gt_rot = (gt_full @ R_aug.T).astype(np.float32)
+            n_rot = (gt_nrm @ R_aug.T).astype(np.float32)
 
-            gt_2048_base = resample(gt_rot, args.num_gt)
+            gt_min, gt_max = gt_rot.min(axis=0), gt_rot.max(axis=0)
+            extent = float(np.max(gt_max - gt_min))
 
-            # (3) Fibonacci cameras
             cameras = fibonacci_sphere_cameras(args.num_views, args.hpr_sphere_r, jitter=args.fib_jitter)
 
             for vi in range(args.num_views):
@@ -325,15 +341,24 @@ def main():
 
                 cor, cor_n = _ensure_min_points(cor, cor_n, args.min_keep)
 
-                # density-weighted resample
-                p_obs = density_weighted_resample(cor, camera_pos, args.num_obs, alpha=args.density_alpha)
+                # 传感器噪声
+                cor = cor + np.random.normal(0, args.noise_std, cor.shape).astype(np.float32)
 
-                # bbox + pca
-                p_norm, C_bbox = normalize_by_bbox(p_obs)
+                p_corrupted = density_weighted_resample(cor, camera_pos, args.num_obs, alpha=args.density_alpha)
+                gt_2048_origin = resample(gt_rot, args.num_gt)
+
+                # ── 阶段二：随机 SE3 投射 ──
+                R_se3 = random_rotation_matrix(args.se3_rot_max_deg)
+                t_se3 = random_translation(args.se3_trans_min, args.se3_trans_max, extent)
+
+                p_obs = (p_corrupted @ R_se3.T + t_se3[None, :]).astype(np.float32)
+                gt_w = (gt_2048_origin @ R_se3.T + t_se3[None, :]).astype(np.float32)
+
+                # ── 阶段三：归一化 ──
+                p_norm, C_bbox, scale = normalize_by_bbox(p_obs)
                 p_in, R_pca, mu_pca = pca_align(p_norm, target_axis=args.pca_axis)
-                gt_sync = (gt_rot - C_bbox[None, :]).astype(np.float32)
-                gt_out = apply_pca_rigid(gt_sync, R_pca, mu_pca)
-                gt_2048 = resample(gt_out, args.num_gt)
+                gt_norm = ((gt_w - C_bbox[None, :]) / scale).astype(np.float32)
+                gt_out = apply_pca_rigid(gt_norm, R_pca, mu_pca)
 
                 if num_aug > 1:
                     stem = f"{base_name}_aug{aug_id:02d}_v{vi}"
@@ -343,14 +368,19 @@ def main():
                 sr = os.path.join(out_root, split)
                 np.save(os.path.join(sr, "obs", f"{stem}.npy"), p_obs.astype(np.float32))
                 np.save(os.path.join(sr, "input", f"{stem}.npy"), p_in.astype(np.float32))
-                np.save(os.path.join(sr, "gt", f"{stem}.npy"), gt_2048.astype(np.float32))
+                np.save(os.path.join(sr, "gt", f"{stem}.npy"), gt_out.astype(np.float32))
                 np.savez(
                     os.path.join(sr, "meta", f"{stem}.npz"),
-                    C_bbox=C_bbox, R_pca=R_pca, mu_pca=mu_pca,
-                    R_rand=R_rand, camera_pos=camera_pos,
-                    missing_rate=np.float32(mr), n_visible=np.int32(vis_pts.shape[0]),
-                    n_after_removal=np.int32(cor.shape[0]), view_idx=np.int32(vi),
-                    aug_id=np.int32(aug_id), category=np.array([cat]),
+                    C_bbox=C_bbox, scale=np.float32(scale),
+                    R_pca=R_pca, mu_pca=mu_pca,
+                    R_se3=R_se3, t_se3=t_se3,
+                    R_aug=R_aug, camera_pos=camera_pos,
+                    missing_rate=np.float32(mr),
+                    n_visible=np.int32(vis_pts.shape[0]),
+                    n_after_removal=np.int32(cor.shape[0]),
+                    view_idx=np.int32(vi),
+                    aug_id=np.int32(aug_id),
+                    category=np.array([cat]),
                 )
                 total[split] += 1
 

@@ -108,11 +108,12 @@ def apply_inverse_normalization(p_comp: np.ndarray, meta: dict) -> np.ndarray:
       p_rough = p_norm + C_bbox
     """
     C_bbox = meta["C_bbox"].astype(np.float32).reshape(1, 3)
+    scale = float(meta["scale"]) if "scale" in meta else 1.0
     R_pca = meta["R_pca"].astype(np.float32).reshape(3, 3)
     mu_pca = meta.get("mu_pca", np.zeros(3, dtype=np.float32)).astype(np.float32).reshape(3)
 
     p_norm = inverse_pca(p_comp, R_pca, mu_pca)
-    p_rough = (p_norm + C_bbox).astype(np.float32)
+    p_rough = (p_norm * scale + C_bbox).astype(np.float32)
     return p_rough
 
 

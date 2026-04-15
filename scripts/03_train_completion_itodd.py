@@ -6,11 +6,13 @@ scripts/03_train_completion_itodd.py
 - 默认 data_root 指向 data/itodd_processed_with_removal
 """
 
+import csv
 import os
 import sys
 import argparse
 import logging
 from collections import OrderedDict
+from datetime import datetime
 
 import torch
 import torch.optim as optim
@@ -33,9 +35,9 @@ log = logging.getLogger(__name__)
 _chamfer_fn = chamfer_3DDist()
 
 
-def chamfer_l1(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+def chamfer_l1(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     dist1, dist2, _, _ = _chamfer_fn(pred, gt)
-    return (dist1.sqrt().mean(dim=1) + dist2.sqrt().mean(dim=1)).mean()
+    return ((dist1 + eps).sqrt().mean(dim=1) + (dist2 + eps).sqrt().mean(dim=1)).mean()
 
 
 def load_pretrained(model: SnowflakeNet, ckpt_path: str):
@@ -100,6 +102,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
         outs = model(inp)
         loss = sum(w * chamfer_l1(o, gt) for w, o in zip(weights, outs))
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
         optimizer.step()
         total_loss += loss.item()
         if (i + 1) % 20 == 0:
@@ -116,6 +119,46 @@ def validate(model, loader, device):
         pred = model(inp)[-1]
         total += chamfer_l1(pred, gt).item()
     return total / len(loader)
+
+
+def plot_curves(csv_path: str, save_dir: str):
+    """读取训练日志 CSV，画 loss 和 lr 曲线并保存为 PNG。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs, train_losses, val_losses, lrs = [], [], [], []
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            epochs.append(int(row["epoch"]))
+            train_losses.append(float(row["train_loss"]))
+            val_losses.append(float(row["val_loss"]))
+            lrs.append(float(row["lr"]))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(epochs, train_losses, "b-o", markersize=3, label="Train CD-L1")
+    ax1.plot(epochs, val_losses, "r-o", markersize=3, label="Val CD-L1")
+    best_idx = int(np.argmin(val_losses))
+    ax1.axvline(epochs[best_idx], color="green", linestyle="--", alpha=0.6, label=f"Best val @ ep{epochs[best_idx]}")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Chamfer-L1")
+    ax1.set_title("Training & Validation Loss")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(epochs, lrs, "g-o", markersize=3)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Learning Rate")
+    ax2.set_title("LR Schedule")
+    ax2.set_yscale("log")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    png_path = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+    log.info(f"曲线图已保存: {png_path}")
 
 
 def main(args):
@@ -139,15 +182,41 @@ def main(args):
     best = float("inf")
     best_path = os.path.join(args.save_dir, "ckpt-itodd-best.pth")
 
+    # ── CSV log ──
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(args.save_dir, f"train_log_{timestamp}.csv")
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["epoch", "train_loss", "val_loss", "lr", "best_val", "is_best"])
+    log.info(f"训练日志: {csv_path}")
+
+    # ── file log ──
+    file_handler = logging.FileHandler(os.path.join(args.save_dir, f"train_{timestamp}.log"))
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(file_handler)
+
     for epoch in range(1, args.epochs + 1):
         tr = train_one_epoch(model, train_loader, optimizer, device, epoch)
         va = validate(model, val_loader, device)
         scheduler.step(va)
-        log.info(f"Epoch {epoch:03d}/{args.epochs} train {tr:.6f} val {va:.6f} lr {optimizer.param_groups[0]['lr']:.2e}")
-        if va < best:
+        lr_now = optimizer.param_groups[0]["lr"]
+        is_best = va < best
+        if is_best:
             best = va
             torch.save({"epoch": epoch, "model": model.state_dict(), "val_cd": va}, best_path)
             log.info(f"✅ new best val={best:.6f} saved={best_path}")
+
+        log.info(f"Epoch {epoch:03d}/{args.epochs} train {tr:.6f} val {va:.6f} lr {lr_now:.2e} best {best:.6f}")
+        csv_writer.writerow([epoch, f"{tr:.8f}", f"{va:.8f}", f"{lr_now:.2e}", f"{best:.8f}", int(is_best)])
+        csv_file.flush()
+
+    csv_file.close()
+    log.info(f"训练完成。CSV 日志: {csv_path}")
+
+    try:
+        plot_curves(csv_path, args.save_dir)
+    except Exception as e:
+        log.warning(f"画图失败（不影响训练结果）: {e}")
 
 
 if __name__ == "__main__":
