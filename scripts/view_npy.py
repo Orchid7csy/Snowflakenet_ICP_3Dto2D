@@ -40,8 +40,8 @@ def compare_gt_input_abs_space(
 def main():
     root = '/home/csy/SnowflakeNet_FPFH_ICP'
     parser = argparse.ArgumentParser(description='同坐标系可视化两个 npy 点云')
-    parser.add_argument('--gt', default=f'{root}/data/processed_with_removal/test/gt/airplane_0627_v1.npy')
-    parser.add_argument('--input', default=f'{root}/data/processed_with_removal/test/input/airplane_0627_v1.npy')
+    parser.add_argument('--gt', default=f'{root}/data/itodd_processed_with_removal_16k_min1024/train/gt/itodd_s000001_im000015_inst000000_obj000018.npy')
+    parser.add_argument('--input', default=f'{root}/data/itodd_processed_with_removal_16k_min1024/train/input/itodd_s000001_im000015_inst000000_obj000018.npy')
     parser.add_argument('--point-size', type=float, default=2.0)
     args = parser.parse_args()
     compare_gt_input_abs_space(args.gt, args.input, point_size=args.point_size)
