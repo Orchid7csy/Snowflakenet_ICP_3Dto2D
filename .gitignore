@@ -32,7 +32,7 @@ env/
 
 # 明确忽略：第三方/大文件/数据/权重/压缩包/点云
 Snet/
-data/
+/data/
 checkpoints/
 test_demo/
 
