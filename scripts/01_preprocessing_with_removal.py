@@ -261,10 +261,17 @@ def process_single_file(args):
         for view_idx in range(num_views):
             r = 3.0
             # 视角约定：
-            # - v0 固定为“俯拍”：相机在 +Z 正上方（2.5D / HPR 的 top-down 观测）
+            # - v0 为“工业俯视视角”：相机位于正上方附近的小倾角半球
+            #   phi ∈ [0, pi/12]（0°~15°），theta ∈ [0, 2pi] 随机
             # - v1~v7 维持随机视角（增强多视角退化）
             if view_idx == 0:
-                camera_pos = np.array([0.0, 0.0, r], dtype=np.float32)
+                theta = np.random.uniform(0, 2 * np.pi)
+                phi = np.random.uniform(0, np.pi / 12.0)
+                camera_pos = np.array([
+                    r * np.sin(phi) * np.cos(theta),
+                    r * np.sin(phi) * np.sin(theta),
+                    r * np.cos(phi),
+                ], dtype=np.float32)
             else:
                 theta = np.random.uniform(0, 2 * np.pi)
                 phi = np.random.uniform(0, np.pi)
