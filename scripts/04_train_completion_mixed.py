@@ -122,8 +122,8 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--modelnet_root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/processed_with_removal")
-    p.add_argument("--itodd_root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/itodd_processed_with_removal")
+    p.add_argument("--modelnet_root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/processed/modelnet40/processed_with_removal_16k_min1024")
+    p.add_argument("--itodd_root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/processed/itodd")
     p.add_argument("--ckpt_pretrain", default="/home/csy/SnowflakeNet_FPFH_ICP/Snet/SnowflakeNet-main/completion/checkpoints/ckpt-best-pcn-cd_l1.pth")
     p.add_argument("--save_dir", default="/home/csy/SnowflakeNet_FPFH_ICP/checkpoints/snet_finetune_mixed")
     p.add_argument("--epochs", type=int, default=100)

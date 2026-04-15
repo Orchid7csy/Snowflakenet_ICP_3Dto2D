@@ -15,6 +15,7 @@ from collections import OrderedDict
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import numpy as np
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 snet_root = os.path.join(project_root, "Snet", "SnowflakeNet-main")
@@ -49,6 +50,46 @@ def load_pretrained(model: SnowflakeNet, ckpt_path: str):
     log.info(f"预训练权重加载成功：{ckpt_path}")
 
 
+class SnowflakeDatasetSeparateRoots(SnowflakeDataset):
+    """
+    input 和 gt 分别来自不同 root。
+    结构要求：
+      <input_root>/<split>/input/*.npy
+      <gt_root>/<split>/gt/*.npy
+    """
+
+    def __init__(self, input_root: str, gt_root: str, split: str = "train", num_points: int = 2048, transform=None):
+        self.input_path = os.path.join(input_root, split, "input")
+        self.gt_path = os.path.join(gt_root, split, "gt")
+        self.file_list = [f for f in os.listdir(self.input_path) if f.endswith(".npy")]
+        self.num_points = num_points
+        self.transform = transform
+        self.split = split
+
+    def _resample(self, pcd, n):
+        curr_n = pcd.shape[0]
+        if curr_n == n:
+            return pcd
+        if curr_n > n:
+            idx = np.random.choice(curr_n, n, replace=False)
+        else:
+            if curr_n == 0:
+                return np.zeros((n, 3), dtype=np.float32)
+            idx = np.concatenate([np.arange(curr_n), np.random.choice(curr_n, n - curr_n, replace=True)])
+        return pcd[idx]
+
+
+def build_dataset(args, split: str):
+    if args.input_root and args.gt_root:
+        return SnowflakeDatasetSeparateRoots(
+            args.input_root,
+            args.gt_root,
+            split=split,
+            num_points=args.num_points,
+        )
+    return SnowflakeDataset(args.data_root, split=split, num_points=args.num_points)
+
+
 def train_one_epoch(model, loader, optimizer, device, epoch):
     model.train()
     total_loss = 0.0
@@ -81,8 +122,8 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"device={device}")
 
-    train_ds = SnowflakeDataset(args.data_root, split="train", num_points=2048)
-    val_ds = SnowflakeDataset(args.data_root, split="test", num_points=2048)
+    train_ds = build_dataset(args, split="train")
+    val_ds = build_dataset(args, split="test")
     log.info(f"train={len(train_ds)} val={len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
@@ -111,11 +152,14 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/itodd_processed_with_removal")
+    p.add_argument("--data_root", default="/home/csy/SnowflakeNet_FPFH_ICP/data/processed/itodd")
+    p.add_argument("--input_root", default=None, help="可选：input 的 root（若提供则覆盖 data_root）")
+    p.add_argument("--gt_root", default=None, help="可选：gt 的 root（若提供则覆盖 data_root）")
     p.add_argument("--ckpt_pretrain", default="/home/csy/SnowflakeNet_FPFH_ICP/Snet/SnowflakeNet-main/completion/checkpoints/ckpt-best-pcn-cd_l1.pth")
     p.add_argument("--save_dir", default="/home/csy/SnowflakeNet_FPFH_ICP/checkpoints/snet_finetune_itodd")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--num_points", type=int, default=2048)
     main(p.parse_args())
 
