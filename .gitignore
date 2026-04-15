@@ -1,0 +1,57 @@
+# 默认忽略所有内容（白名单式版本控制：只跟踪核心代码）
+*
+
+# 允许版本控制本文件
+!.gitignore
+
+# 仅放行核心代码目录
+!src/
+!src/**
+!scripts/
+!scripts/**
+
+# 常见：Python 生成文件（即便在 src/scripts 内也应忽略）
+**/__pycache__/
+**/*.py[cod]
+**/*.so
+**/*.pyd
+**/*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+
+# 明确忽略：第三方/大文件/数据/权重/压缩包/点云
+Snet/
+data/
+checkpoints/
+test_demo/
+
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npz
+*.npy
+*.pcd
+*.ply
+*.obj
+*.stl
+*.off
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
