@@ -33,7 +33,26 @@ for _p in (_PROJECT_ROOT, _SNET_ROOT):
 from models.model_completion import SnowflakeNet
 
 
-def test_single_npy(npy_path, weight_path, out_npy_path, show_vis=True):
+def _resample_points(data: np.ndarray, target_n: int = 2048) -> np.ndarray:
+    if data.shape[0] < target_n:
+        idx = np.random.choice(data.shape[0], target_n, replace=True)
+        return data[idx]
+    if data.shape[0] > target_n:
+        idx = np.random.choice(data.shape[0], target_n, replace=False)
+        return data[idx]
+    return data
+
+
+def _export_stage_outputs(stage_outputs, export_dir: str, stem: str) -> None:
+    os.makedirs(export_dir, exist_ok=True)
+    stage_names = ["pc_seed", "p1", "p2", "p3"]
+    for name, pts in zip(stage_names, stage_outputs):
+        out_path = os.path.join(export_dir, f"{stem}_{name}.npy")
+        np.save(out_path, pts.astype(np.float32))
+        print(f"[stage export] {name}: {out_path}")
+
+
+def test_single_npy(npy_path, weight_path, out_npy_path, show_vis=True, export_stages_dir=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     map_loc = device if device.type == 'cuda' else 'cpu'
 
@@ -51,19 +70,14 @@ def test_single_npy(npy_path, weight_path, out_npy_path, show_vis=True):
     model.eval()
 
     data = np.load(npy_path).astype(np.float32)
-
-    if data.shape[0] < 2048:
-        idx = np.random.choice(data.shape[0], 2048, replace=True)
-        data = data[idx]
-    elif data.shape[0] > 2048:
-        idx = np.random.choice(data.shape[0], 2048, replace=False)
-        data = data[idx]
+    data = _resample_points(data, target_n=2048)
 
     input_tensor = torch.from_numpy(data).unsqueeze(0).to(device)
 
     with torch.no_grad():
         ret = model(input_tensor)
-        dense_points = ret[-1].squeeze().cpu().numpy()
+        stage_outputs = [o.squeeze(0).detach().cpu().numpy() for o in ret]
+        dense_points = stage_outputs[-1]
 
     out_abs = os.path.abspath(out_npy_path)
     out_dir = os.path.dirname(out_abs)
@@ -75,6 +89,10 @@ def test_single_npy(npy_path, weight_path, out_npy_path, show_vis=True):
         f"补全完成。输入点数: {data.shape[0]}, 输出点数: {dense_points.shape[0]}\n"
         f"已保存: {out_abs}"
     )
+
+    if export_stages_dir:
+        stem, _ = os.path.splitext(os.path.basename(npy_path))
+        _export_stage_outputs(stage_outputs, os.path.abspath(export_stages_dir), stem)
 
     if show_vis:
         pcd_in = o3d.geometry.PointCloud()
@@ -102,7 +120,7 @@ def main():
         '-i', '--input',
         default=os.path.join(
             _PROJECT_ROOT,
-            'data/processed_with_removal/test/input/airplane_0627_v1.npy',
+            'data/processed/itodd/test/input/obj000001_aug0031_v0.npy',
         ),
         help='输入残缺点云 .npy (N,3)',
     )
@@ -110,7 +128,7 @@ def main():
         '-c', '--ckpt',
         default=os.path.join(
             _PROJECT_ROOT,
-            'checkpoints/snet_finetune/ckpt-airplane-best.pth',
+            'checkpoints/snet_finetune_itodd/ckpt-itodd-best.pth',
         ),
         help='模型权重路径',
     )
@@ -124,10 +142,21 @@ def main():
         action='store_true',
         help='不弹出 Open3D 可视化窗口',
     )
+    parser.add_argument(
+        '--export-stages-dir',
+        default=None,
+        help='若指定，则额外导出 pc_seed/p1/p2/p3 到该目录，便于排查 seed points 是否对齐',
+    )
     args = parser.parse_args()
 
     out_path = args.out if args.out else _default_out_path(args.input)
-    test_single_npy(args.input, args.ckpt, out_path, show_vis=not args.no_vis)
+    test_single_npy(
+        args.input,
+        args.ckpt,
+        out_path,
+        show_vis=not args.no_vis,
+        export_stages_dir=args.export_stages_dir,
+    )
 
 
 if __name__ == '__main__':

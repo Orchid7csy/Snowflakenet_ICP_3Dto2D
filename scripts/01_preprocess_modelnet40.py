@@ -3,7 +3,7 @@ scripts/01_preprocess_modelnet40.py
 
 ModelNet40 (.off) completion 训练集生成器。
 
-五阶段管线（与 ITODD 统一）：
+三阶段管线（与 ITODD 统一）：
   阶段一（原点空间）: mesh 采样 → 单位球归一化 → SO(3) → HPR + dropout + 高斯噪声
   阶段二（观测空间）: 残缺点云 × (R_se3, t_se3) → P_obs（模拟真实观测位置）
                      完整点云同步变换 → GT_w
@@ -252,7 +252,19 @@ def main():
     ap.add_argument("--missing-rate-min", type=float, default=0.1)
     ap.add_argument("--missing-rate-max", type=float, default=0.4)
     ap.add_argument("--hpr-sphere-r", type=float, default=3.0)
-    ap.add_argument("--hpr-radius", type=float, default=100.0)
+    ap.add_argument(
+        "--hpr-radius",
+        type=float,
+        default=100.0,
+        help="Open3D HPR radius 下限；实际使用 max(hpr_radius, hpr_radius_factor*(hpr_sphere_r+1))",
+    )
+    ap.add_argument(
+        "--hpr-radius-factor",
+        type=float,
+        default=25.0,
+        help="与相机距离匹配：单位球上最远点距相机约 hpr_sphere_r+1，"
+        "自动下界 = factor * (hpr_sphere_r+1)。默认 25 且 sphere_r=3 时与旧版 hpr_radius=100 一致",
+    )
     ap.add_argument("--fib-jitter", type=float, default=0.15)
     ap.add_argument("--density-alpha", type=float, default=1.5)
     ap.add_argument("--noise-std", type=float, default=0.002)
@@ -296,6 +308,16 @@ def main():
 
     total = {"train": 0, "test": 0}
 
+    _cam_to_far = float(args.hpr_sphere_r) + 1.0
+    hpr_r_effective = max(
+        float(args.hpr_radius),
+        float(args.hpr_radius_factor) * _cam_to_far,
+    )
+    print(
+        f"HPR: sphere_r={args.hpr_sphere_r}  effective_radius={hpr_r_effective:.4f} "
+        f"(max of --hpr-radius and factor*(sphere_r+1))"
+    )
+
     for file_path, cat, split in tqdm(entries, desc="Processing"):
         mesh = _read_off_mesh(file_path)
         if not mesh.has_triangles():
@@ -324,7 +346,9 @@ def main():
                 # HPR
                 pcd_hpr = o3d.geometry.PointCloud()
                 pcd_hpr.points = o3d.utility.Vector3dVector(gt_rot.astype(np.float64))
-                _, pt_map = pcd_hpr.hidden_point_removal(camera_pos.astype(np.float64), args.hpr_radius)
+                _, pt_map = pcd_hpr.hidden_point_removal(
+                    camera_pos.astype(np.float64), hpr_r_effective
+                )
                 pt_map = np.asarray(pt_map, dtype=np.int64)
                 vis_pts = gt_rot[pt_map]
                 vis_nrm = n_rot[pt_map]
@@ -381,6 +405,7 @@ def main():
                     view_idx=np.int32(vi),
                     aug_id=np.int32(aug_id),
                     category=np.array([cat]),
+                    hpr_radius_used=np.float32(hpr_r_effective),
                 )
                 total[split] += 1
 

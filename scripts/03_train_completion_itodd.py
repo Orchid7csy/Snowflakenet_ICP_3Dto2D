@@ -13,6 +13,7 @@ import argparse
 import logging
 from collections import OrderedDict
 from datetime import datetime
+from typing import List
 
 import torch
 import torch.optim as optim
@@ -38,6 +39,71 @@ _chamfer_fn = chamfer_3DDist()
 def chamfer_l1(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     dist1, dist2, _, _ = _chamfer_fn(pred, gt)
     return ((dist1 + eps).sqrt().mean(dim=1) + (dist2 + eps).sqrt().mean(dim=1)).mean()
+
+
+def parse_stage_weights(text: str) -> List[float]:
+    vals = [float(x.strip()) for x in text.split(",") if x.strip()]
+    if len(vals) != 4:
+        raise argparse.ArgumentTypeError("stage_weights 必须是 4 个逗号分隔浮点数，对应 Pc,P1,P2,P3")
+    return vals
+
+
+@torch.no_grad()
+def compute_gt_edge_weights(gt: torch.Tensor, k: int = 24, power: float = 1.0) -> torch.Tensor:
+    """
+    用 GT 局部协方差的最小特征值占比近似“曲率/边缘性”，
+    只给 gt->pred 方向额外加权，鼓励模型覆盖尖边与高曲率区域。
+    """
+    bsz, n_pts, _ = gt.shape
+    if n_pts <= 1:
+        return torch.ones((bsz, n_pts), device=gt.device, dtype=gt.dtype)
+
+    k = max(1, min(int(k), n_pts - 1))
+    pairwise = torch.cdist(gt, gt)
+    knn_idx = pairwise.topk(k=k + 1, largest=False).indices[:, :, 1:]
+    batch_idx = torch.arange(bsz, device=gt.device).view(bsz, 1, 1)
+    neighbors = gt[batch_idx, knn_idx]
+    centered = neighbors - gt.unsqueeze(2)
+    cov = centered.transpose(-1, -2) @ centered / float(k)
+    eigvals = torch.linalg.eigvalsh(cov)
+    curvature = eigvals[..., 0] / eigvals.sum(dim=-1).clamp_min(1e-8)
+    weights = curvature.clamp_min(1e-6).pow(float(power))
+    weights = weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-8)
+    return weights
+
+
+def edge_aware_gt_penalty(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    gt_edge_weights: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    _, dist2, _, _ = _chamfer_fn(pred, gt)
+    gt_to_pred = (dist2 + eps).sqrt()
+    return (gt_to_pred * gt_edge_weights).mean()
+
+
+def compute_training_loss(
+    outputs,
+    gt: torch.Tensor,
+    stage_weights: List[float],
+    edge_loss_weight: float,
+    edge_k: int,
+    edge_power: float,
+) -> torch.Tensor:
+    gt_edge_weights = None
+    if edge_loss_weight > 0:
+        gt_edge_weights = compute_gt_edge_weights(gt, k=edge_k, power=edge_power)
+
+    total = torch.zeros((), device=gt.device, dtype=gt.dtype)
+    for stage_w, out in zip(stage_weights, outputs):
+        if stage_w == 0:
+            continue
+        stage_loss = chamfer_l1(out, gt)
+        if gt_edge_weights is not None:
+            stage_loss = stage_loss + float(edge_loss_weight) * edge_aware_gt_penalty(out, gt, gt_edge_weights)
+        total = total + float(stage_w) * stage_loss
+    return total
 
 
 def load_pretrained(model: SnowflakeNet, ckpt_path: str):
@@ -92,15 +158,21 @@ def build_dataset(args, split: str):
     return SnowflakeDataset(args.data_root, split=split, num_points=args.num_points)
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch):
+def train_one_epoch(model, loader, optimizer, device, epoch, stage_weights, edge_loss_weight, edge_k, edge_power):
     model.train()
     total_loss = 0.0
-    weights = [0.0, 0.1, 0.2, 0.7]
     for i, (inp, gt) in enumerate(loader):
         inp, gt = inp.to(device), gt.to(device)
         optimizer.zero_grad()
         outs = model(inp)
-        loss = sum(w * chamfer_l1(o, gt) for w, o in zip(weights, outs))
+        loss = compute_training_loss(
+            outs,
+            gt,
+            stage_weights=stage_weights,
+            edge_loss_weight=edge_loss_weight,
+            edge_k=edge_k,
+            edge_power=edge_power,
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
         optimizer.step()
@@ -162,8 +234,16 @@ def plot_curves(csv_path: str, save_dir: str):
 
 
 def main(args):
+    args.stage_weights = parse_stage_weights(args.stage_weights)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"device={device}")
+    log.info(
+        "loss config | stage_weights=%s edge_loss_weight=%.4f edge_k=%d edge_power=%.3f",
+        args.stage_weights,
+        args.edge_loss_weight,
+        args.edge_k,
+        args.edge_power,
+    )
 
     train_ds = build_dataset(args, split="train")
     val_ds = build_dataset(args, split="test")
@@ -196,7 +276,17 @@ def main(args):
     log.addHandler(file_handler)
 
     for epoch in range(1, args.epochs + 1):
-        tr = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        tr = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            stage_weights=args.stage_weights,
+            edge_loss_weight=args.edge_loss_weight,
+            edge_k=args.edge_k,
+            edge_power=args.edge_power,
+        )
         va = validate(model, val_loader, device)
         scheduler.step(va)
         lr_now = optimizer.param_groups[0]["lr"]
@@ -229,6 +319,20 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument(
+        "--stage_weights",
+        type=str,
+        default="0.0,0.1,0.2,0.7",
+        help="四阶段 loss 权重，顺序为 Pc,P1,P2,P3",
+    )
+    p.add_argument(
+        "--edge_loss_weight",
+        type=float,
+        default=0.0,
+        help="额外的 edge-aware gt->pred 惩罚权重；0 表示关闭",
+    )
+    p.add_argument("--edge_k", type=int, default=24, help="edge-aware 权重的 kNN 邻域大小")
+    p.add_argument("--edge_power", type=float, default=1.0, help="edge-aware 曲率权重指数")
     p.add_argument("--num_points", type=int, default=2048)
     main(p.parse_args())
 
