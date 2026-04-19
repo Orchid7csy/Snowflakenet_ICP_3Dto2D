@@ -247,7 +247,13 @@ def main():
     ap.add_argument("--num-views", type=int, default=8)
     ap.add_argument("--num-cad-sample", type=int, default=16384)
     ap.add_argument("--num-obs", type=int, default=2048)
-    ap.add_argument("--num-gt", type=int, default=2048)
+    ap.add_argument(
+        "--num-gt",
+        type=int,
+        default=16384,
+        help="GT 稠密点云的点数。默认 16384 与 PCN/SnowflakeNet 原实验对齐 "
+        "(up_factors=[1,4,8] 时 P3=16384，与 GT 同分辨率)",
+    )
     ap.add_argument("--min-keep", type=int, default=1024)
     ap.add_argument("--missing-rate-min", type=float, default=0.1)
     ap.add_argument("--missing-rate-max", type=float, default=0.4)
