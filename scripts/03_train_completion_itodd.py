@@ -26,6 +26,11 @@ for p in [project_root, snet_root]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+import wandb_utils  # noqa: E402
+
 from src.data.dataset import SnowflakeDataset
 from models.model_completion import SnowflakeNet
 from loss_functions.Chamfer3D.dist_chamfer_3D import chamfer_3DDist
@@ -158,39 +163,28 @@ def build_dataset(args, split: str):
     return SnowflakeDataset(args.data_root, split=split, num_points=args.num_points)
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, stage_weights, edge_loss_weight, edge_k, edge_power):
-    model.train()
-    total_loss = 0.0
-    for i, (inp, gt) in enumerate(loader):
-        inp, gt = inp.to(device), gt.to(device)
-        optimizer.zero_grad()
-        outs = model(inp)
-        loss = compute_training_loss(
-            outs,
-            gt,
-            stage_weights=stage_weights,
-            edge_loss_weight=edge_loss_weight,
-            edge_k=edge_k,
-            edge_power=edge_power,
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-        optimizer.step()
-        total_loss += loss.item()
-        if (i + 1) % 20 == 0:
-            log.info(f"Epoch {epoch:03d} step {i+1:4d}/{len(loader)} loss {loss.item():.6f}")
-    return total_loss / len(loader)
-
-
 @torch.no_grad()
-def validate(model, loader, device):
+def validate(model, loader, device, max_batches=None, log_wandb_3d=False, log_step=0):
     model.eval()
     total = 0.0
-    for inp, gt in loader:
-        inp, gt = inp.to(device), gt.to(device)
-        pred = model(inp)[-1]
+    n_batch = 0
+    for i, (inp, gt) in enumerate(loader):
+        if max_batches is not None and i >= max_batches:
+            break
+        inp, gt = inp.to(device, non_blocking=True), gt.to(device, non_blocking=True)
+        outs = model(inp)
+        pred = outs[-1]
+        if log_wandb_3d and i == 0:
+            wandb_utils.log_val_pointclouds(
+                gt[0].detach().cpu().numpy(),
+                pred[0].detach().cpu().numpy(),
+                step=log_step,
+                prefix="val",
+            )
         total += chamfer_l1(pred, gt).item()
-    return total / len(loader)
+        n_batch += 1
+    model.train()
+    return total / max(n_batch, 1)
 
 
 def plot_curves(csv_path: str, save_dir: str):
@@ -235,6 +229,14 @@ def plot_curves(csv_path: str, save_dir: str):
 
 def main(args):
     args.stage_weights = parse_stage_weights(args.stage_weights)
+    wandb_run = wandb_utils.init_wandb(args)
+    try:
+        _run_training(args, wandb_run)
+    finally:
+        wandb_utils.finish_wandb(wandb_run)
+
+
+def _run_training(args, wandb_run):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"device={device}")
     log.info(
@@ -248,15 +250,38 @@ def main(args):
     train_ds = build_dataset(args, split="train")
     val_ds = build_dataset(args, split="test")
     log.info(f"train={len(train_ds)} val={len(val_ds)}")
+    if len(train_ds) >= 100_000:
+        log.info(
+            "数据集规模较大（如 130k 级）：DataLoader 流式迭代；step 级 mini-val 已启用。"
+        )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
     model = SnowflakeNet(up_factors=[1, 4, 8]).to(device)
     load_pretrained(model, args.ckpt_pretrain)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=args.lr_patience,
+        min_lr=1e-6,
+    )
 
     os.makedirs(args.save_dir, exist_ok=True)
     best = float("inf")
@@ -275,30 +300,94 @@ def main(args):
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
     log.addHandler(file_handler)
 
+    global_step = 0
+
     for epoch in range(1, args.epochs + 1):
-        tr = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            epoch,
-            stage_weights=args.stage_weights,
-            edge_loss_weight=args.edge_loss_weight,
-            edge_k=args.edge_k,
-            edge_power=args.edge_power,
-        )
-        va = validate(model, val_loader, device)
-        scheduler.step(va)
+        model.train()
+        running_loss = 0.0
+        n_steps_in_epoch = 0
+
+        for i, (inp, gt) in enumerate(train_loader):
+            inp, gt = inp.to(device, non_blocking=True), gt.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            outs = model(inp)
+            loss = compute_training_loss(
+                outs,
+                gt,
+                stage_weights=args.stage_weights,
+                edge_loss_weight=args.edge_loss_weight,
+                edge_k=args.edge_k,
+                edge_power=args.edge_power,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            optimizer.step()
+
+            running_loss += loss.item()
+            n_steps_in_epoch += 1
+            global_step += 1
+
+            if global_step % args.log_every == 0:
+                lr_now = optimizer.param_groups[0]["lr"]
+                log.info(
+                    f"Epoch {epoch:03d} step {i+1:5d}/{len(train_loader)} "
+                    f"| gstep {global_step:7d} | loss {loss.item():.6f} | lr {lr_now:.2e}"
+                )
+                wandb_utils.log_train_metrics(loss.item(), lr_now, global_step)
+
+            if global_step % args.val_every_steps == 0:
+                val_cd = validate(
+                    model,
+                    val_loader,
+                    device,
+                    max_batches=args.val_batches,
+                    log_wandb_3d=(wandb_run is not None),
+                    log_step=global_step,
+                )
+                scheduler.step(val_cd)
+                lr_now = optimizer.param_groups[0]["lr"]
+                log.info(
+                    f"[mini-val] gstep {global_step:7d} | val_cd {val_cd:.6f} "
+                    f"| lr {lr_now:.2e} | best {best:.6f}"
+                )
+                wandb_utils.log_wandb_scalars(
+                    {
+                        "val/mini_chamfer": val_cd,
+                        "val/learning_rate": lr_now,
+                        "val/best_chamfer": best,
+                    },
+                    global_step,
+                )
+                if val_cd < best:
+                    best = val_cd
+                    torch.save(
+                        {"epoch": epoch, "global_step": global_step, "model": model.state_dict(), "val_cd": val_cd},
+                        best_path,
+                    )
+                    log.info(f"✅ new best (mini-val) val={best:.6f} saved={best_path}")
+
+        tr = running_loss / max(n_steps_in_epoch, 1)
+        va = validate(model, val_loader, device, max_batches=None)
         lr_now = optimizer.param_groups[0]["lr"]
         is_best = va < best
         if is_best:
             best = va
-            torch.save({"epoch": epoch, "model": model.state_dict(), "val_cd": va}, best_path)
+            torch.save({"epoch": epoch, "global_step": global_step, "model": model.state_dict(), "val_cd": va}, best_path)
             log.info(f"✅ new best val={best:.6f} saved={best_path}")
 
-        log.info(f"Epoch {epoch:03d}/{args.epochs} train {tr:.6f} val {va:.6f} lr {lr_now:.2e} best {best:.6f}")
+        log.info(f"Epoch {epoch:03d}/{args.epochs} train {tr:.6f} full_val {va:.6f} lr {lr_now:.2e} best {best:.6f}")
         csv_writer.writerow([epoch, f"{tr:.8f}", f"{va:.8f}", f"{lr_now:.2e}", f"{best:.8f}", int(is_best)])
         csv_file.flush()
+
+        wandb_utils.log_wandb_scalars(
+            {
+                "epoch": epoch,
+                "train/epoch_avg_loss": tr,
+                "val/full_chamfer": va,
+                "val/best_chamfer": best,
+            },
+            global_step,
+        )
 
     csv_file.close()
     log.info(f"训练完成。CSV 日志: {csv_path}")
@@ -334,5 +423,16 @@ if __name__ == "__main__":
     p.add_argument("--edge_k", type=int, default=24, help="edge-aware 权重的 kNN 邻域大小")
     p.add_argument("--edge_power", type=float, default=1.0, help="edge-aware 曲率权重指数")
     p.add_argument("--num_points", type=int, default=2048)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--no-wandb", action="store_true", help="禁用 Weights & Biases")
+    p.add_argument("--log-every", type=int, default=20, help="每 N 个 global step 记录 train 日志与 W&B")
+    p.add_argument("--val-every-steps", type=int, default=2000)
+    p.add_argument("--val-batches", type=int, default=200, help="mini-val 用前 N 个 batch")
+    p.add_argument(
+        "--lr-patience",
+        type=int,
+        default=5,
+        help="ReduceLROnPlateau：连续多少个 mini-val 无改善则降 lr",
+    )
     main(p.parse_args())
 

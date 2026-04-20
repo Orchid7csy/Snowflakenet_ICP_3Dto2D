@@ -17,6 +17,8 @@ SnowflakeNet 微调脚本（与原 PCN/SnowflakeNet 实验对齐版本）
 
 用法：
     python scripts/02_train_completion.py
+
+W&B：默认 project=`SnowflakeNet_Finetune`，可用环境变量 `WANDB_*` 配置；`--no-wandb` 仅保留本地日志与 checkpoint。
 """
 
 import argparse
@@ -38,6 +40,11 @@ os.makedirs(log_dir, exist_ok=True)
 for p in [project_root, snet_root]:
     if p not in sys.path:
         sys.path.insert(0, p)
+
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+import wandb_utils  # noqa: E402
 
 from src.data.dataset import SnowflakeDataset
 from models.model_completion import SnowflakeNet
@@ -135,7 +142,7 @@ def staged_loss(outputs, gt: torch.Tensor, weights):
 
 # ── 验证 ────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def validate(model, loader, device, max_batches=None):
+def validate(model, loader, device, max_batches=None, log_wandb_3d=False, log_step=0):
     model.eval()
     total_cd = 0.0
     n_batch = 0
@@ -145,6 +152,13 @@ def validate(model, loader, device, max_batches=None):
         inp, gt = inp.to(device, non_blocking=True), gt.to(device, non_blocking=True)
         outputs = model(inp)
         pred = outputs[-1]  # 与 GT 同分辨率（16384）
+        if log_wandb_3d and i == 0:
+            wandb_utils.log_val_pointclouds(
+                gt[0].detach().cpu().numpy(),
+                pred[0].detach().cpu().numpy(),
+                step=log_step,
+                prefix="val",
+            )
         total_cd += chamfer_l1(pred, gt).item()
         n_batch += 1
     model.train()
@@ -159,6 +173,14 @@ def save_ckpt(state, path):
 
 # ── 主函数 ─────────────────────────────────────────────────────────────
 def main(args):
+    wandb_run = wandb_utils.init_wandb(args)
+    try:
+        _run_training(args, wandb_run)
+    finally:
+        wandb_utils.finish_wandb(wandb_run)
+
+
+def _run_training(args, wandb_run):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"使用设备：{device}")
 
@@ -172,6 +194,11 @@ def main(args):
     )
     log.info(f"训练集：{len(train_ds)} 样本  验证集：{len(val_ds)} 样本")
     log.info(f"input_points={args.input_points}  gt_points={args.gt_points}")
+    if len(train_ds) >= 100_000:
+        log.info(
+            "数据集规模较大（如 130k 级）：DataLoader 为流式迭代，内存/显存主要由 batch 与模型决定；"
+            "已启用 step 级 mini-val，无需整 epoch 才看到验证指标。"
+        )
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -237,7 +264,7 @@ def main(args):
             n_steps_in_epoch += 1
             global_step += 1
 
-            # ── step 级日志 ──
+            # ── step 级日志（文件 + W&B） ──
             if global_step % args.log_every == 0:
                 lr_now = optimizer.param_groups[0]['lr']
                 log.info(
@@ -245,15 +272,29 @@ def main(args):
                     f"| gstep {global_step:7d} | loss {loss.item():.6f} "
                     f"| lr {lr_now:.2e}"
                 )
+                wandb_utils.log_train_metrics(loss.item(), lr_now, global_step)
 
             # ── step 级 mini-val + 调度 + best/last 保存 ──
             if global_step % args.val_every_steps == 0:
-                val_cd = validate(model, val_loader, device, max_batches=args.val_batches)
+                val_cd = validate(
+                    model, val_loader, device,
+                    max_batches=args.val_batches,
+                    log_wandb_3d=(wandb_run is not None),
+                    log_step=global_step,
+                )
                 scheduler.step(val_cd)
                 lr_now = optimizer.param_groups[0]['lr']
                 log.info(
                     f"[mini-val] gstep {global_step:7d} | val_cd {val_cd:.6f} "
                     f"| lr {lr_now:.2e} | best {best_cd:.6f}"
+                )
+                wandb_utils.log_wandb_scalars(
+                    {
+                        "val/mini_chamfer": val_cd,
+                        "val/learning_rate": lr_now,
+                        "val/best_chamfer": best_cd,
+                    },
+                    global_step,
                 )
                 save_ckpt(
                     {'epoch': epoch, 'global_step': global_step,
@@ -285,6 +326,15 @@ def main(args):
             f"=== Epoch {epoch:03d}/{args.epochs} done | train_loss_avg {avg:.6f} "
             f"| full_val_cd {full_val:.6f} | best {best_cd:.6f} ==="
         )
+        wandb_utils.log_wandb_scalars(
+            {
+                "epoch": epoch,
+                "train/epoch_avg_loss": avg,
+                "val/full_chamfer": full_val,
+                "val/best_chamfer": best_cd,
+            },
+            global_step,
+        )
 
     log.info(f"训练完成。最优 val_cd = {best_cd:.6f}")
 
@@ -313,8 +363,15 @@ if __name__ == '__main__':
     parser.add_argument('--stage-weights', type=str, default='1.0,1.0,1.0,1.0',
                         help='对应 Pc(256), P1(512), P2(2048), P3(gt_points) 的 CD 权重')
 
+    parser.add_argument(
+        '--no-wandb',
+        action='store_true',
+        help='禁用 Weights & Biases（仍写文件日志与本地 checkpoint）',
+    )
+
     # step 级触发
-    parser.add_argument('--log-every', type=int, default=50)
+    parser.add_argument('--log-every', type=int, default=20,
+                        help='每 N 个 global step 写一次 train 日志与 W&B')
     parser.add_argument('--val-every-steps', type=int, default=2000)
     parser.add_argument('--val-batches', type=int, default=200,
                         help='mini-val 时只取前 N 个 batch（不影响 epoch 末 full-val）')

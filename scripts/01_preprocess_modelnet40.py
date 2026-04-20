@@ -13,12 +13,19 @@ ModelNet40 (.off) completion 训练集生成器。
 
 类别反向加权：少数类别 aug 更多，平衡类别不均。
 train/test 沿用 ModelNet40 原始目录（train/ 或 test/）。
+
+断点续做（默认开启）：
+  对每个 .off，按当前 --base-aug / --max-aug / --num-views 计算应生成的全部 stem，
+  若 train|test/{obs,input,gt,meta} 下四个文件均存在则认为该 mesh 已完成并跳过；
+  否则先删除该 mesh 相关不完整文件再整 mesh 重算（需与上次使用相同增广参数，否则文件名集合不一致）。
+  使用 --no-resume 可强制全量覆盖重算。
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -235,6 +242,110 @@ def _compute_aug_counts(entries, base_aug: int, max_aug: int):
     return aug_map
 
 
+# ── 断点续跑：按「每个 mesh 应产出的 stem」检查 obs/input/gt/meta 是否齐全 ──
+
+
+def _stems_for_mesh(base_name: str, num_aug: int, num_views: int) -> list[str]:
+    stems: list[str] = []
+    for aug_id in range(num_aug):
+        for vi in range(num_views):
+            if num_aug > 1:
+                stems.append(f"{base_name}_aug{aug_id:02d}_v{vi}")
+            else:
+                stems.append(f"{base_name}_v{vi}")
+    return stems
+
+
+def _paths_for_stem(out_root: str, split: str, stem: str) -> Tuple[str, str, str, str]:
+    sr = os.path.join(out_root, split)
+    return (
+        os.path.join(sr, "obs", f"{stem}.npy"),
+        os.path.join(sr, "input", f"{stem}.npy"),
+        os.path.join(sr, "gt", f"{stem}.npy"),
+        os.path.join(sr, "meta", f"{stem}.npz"),
+    )
+
+
+def _entry_fully_written(out_root: str, split: str, stems: list[str]) -> bool:
+    for stem in stems:
+        for p in _paths_for_stem(out_root, split, stem):
+            if not os.path.isfile(p) or os.path.getsize(p) < 1:
+                return False
+    return True
+
+
+def _cleanup_incomplete_entry(out_root: str, split: str, stems: list[str]) -> None:
+    """若该 mesh 未全部写完，删除本 mesh 相关 stem 的已有文件，避免半成品与重跑冲突。"""
+    if _entry_fully_written(out_root, split, stems):
+        return
+    for stem in stems:
+        for p in _paths_for_stem(out_root, split, stem):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+def _bytes_per_stem(num_obs: int, num_gt: int) -> int:
+    float32 = 4
+    return int((num_obs * 3 * 2 + num_gt * 3) * float32 + 8192)
+
+
+def _estimate_remaining_nbytes(
+    entries: list,
+    aug_map: dict,
+    out_root: str,
+    num_views: int,
+    num_obs: int,
+    num_gt: int,
+) -> tuple[int, int, int]:
+    """
+    返回 (未完成 mesh 数, 未完成 stem 总数, 估算剩余字节数)。
+    单 stem 近似 = obs+input (float32) + gt + meta 少量开销。
+    """
+    n_mesh_left = 0
+    n_stems_left = 0
+    b_left = 0
+    per_stem = _bytes_per_stem(num_obs, num_gt)
+
+    for file_path, cat, split in entries:
+        base_name = os.path.basename(file_path).replace(".off", "")
+        num_aug = aug_map.get((cat, split), 1)
+        stems = _stems_for_mesh(base_name, num_aug, num_views)
+        if _entry_fully_written(out_root, split, stems):
+            continue
+        n_mesh_left += 1
+        n_stems_left += len(stems)
+        b_left += per_stem * len(stems)
+    return n_mesh_left, n_stems_left, b_left
+
+
+def _estimate_full_dataset_nbytes(
+    entries: list,
+    aug_map: dict,
+    num_views: int,
+    num_obs: int,
+    num_gt: int,
+) -> tuple[int, int]:
+    """全量跑一遍时的 stem 总数与估算总字节（用于 --no-resume 时的空间提示）。"""
+    per_stem = _bytes_per_stem(num_obs, num_gt)
+    n_stems = 0
+    for file_path, cat, split in entries:
+        base_name = os.path.basename(file_path).replace(".off", "")
+        num_aug = aug_map.get((cat, split), 1)
+        stems = _stems_for_mesh(base_name, num_aug, num_views)
+        n_stems += len(stems)
+    return n_stems, per_stem * n_stems
+
+
+def count_input_samples(out_root: str, split: str) -> int:
+    d = os.path.join(out_root, split, "input")
+    if not os.path.isdir(d):
+        return 0
+    return sum(1 for f in os.listdir(d) if f.endswith(".npy"))
+
+
 # ═══════════════════════════ main ═══════════════════════════
 
 
@@ -281,6 +392,11 @@ def main():
     ap.add_argument("--normal-max-nn", type=int, default=30)
     ap.add_argument("--pca-axis", default="z", choices=("x", "y", "z"))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="关闭断点续做：强制重算全部 mesh（会覆盖已有同名输出）",
+    )
     args = ap.parse_args()
 
     np.random.seed(args.seed)
@@ -294,6 +410,8 @@ def main():
     if not entries:
         print("未找到任何 .off 文件")
         return
+
+    entries.sort(key=lambda x: (x[0], x[1], x[2]))
 
     aug_map = _compute_aug_counts(entries, args.base_aug, args.max_aug)
 
@@ -312,6 +430,71 @@ def main():
         for sub in ("input", "gt", "obs", "meta"):
             os.makedirs(os.path.join(out_root, sp, sub), exist_ok=True)
 
+    resume = not args.no_resume
+    if resume:
+        n_left, n_stems_left, est_bytes = _estimate_remaining_nbytes(
+            entries,
+            aug_map,
+            out_root,
+            args.num_views,
+            args.num_obs,
+            args.num_gt,
+        )
+    else:
+        n_stems_left, est_bytes = _estimate_full_dataset_nbytes(
+            entries, aug_map, args.num_views, args.num_obs, args.num_gt
+        )
+        n_left = len(entries)
+    try:
+        du = shutil.disk_usage(out_root)
+        free_gib = du.free / (1024**3)
+    except OSError:
+        free_gib = float("nan")
+    est_gib = est_bytes / (1024**3)
+    if resume:
+        print(
+            f"[断点续做] resume=开  |  "
+            f"未完成 mesh ≈ {n_left} / {len(entries)}  "
+            f"(约 {n_stems_left} 个 view 样本)"
+        )
+        print(
+            f"[空间估算] 剩余任务约需 {est_gib:.2f} GiB（粗算，含 obs/input/gt/meta）；"
+            f"输出盘可用约 {free_gib:.2f} GiB"
+        )
+    else:
+        print(
+            f"[全量重算] --no-resume：将全部处理 {len(entries)} 个 mesh "
+            f"(约 {n_stems_left} 个 view 样本)，估算总写入 ≈ {est_gib:.2f} GiB；"
+            f"输出盘可用约 {free_gib:.2f} GiB"
+        )
+    if est_bytes > 0 and free_gib == free_gib and free_gib < est_gib * 1.05:
+        print(
+            "[警告] 可用空间与估算需求接近或不足，可能再次写满。"
+            " 建议：删中间文件、扩容数据盘，或降低 --max-aug / --num-views / --num-gt。"
+        )
+
+    todo = []
+    if resume:
+        for e in entries:
+            fp, cat, split = e
+            base_name = os.path.basename(fp).replace(".off", "")
+            num_aug = aug_map.get((cat, split), 1)
+            stems = _stems_for_mesh(base_name, num_aug, args.num_views)
+            if _entry_fully_written(out_root, split, stems):
+                continue
+            _cleanup_incomplete_entry(out_root, split, stems)
+            todo.append(e)
+        if not todo:
+            print(
+                f"全部 mesh 已完整生成，无需继续。"
+                f" 当前 input 样本数 train={count_input_samples(out_root, 'train')} "
+                f"test={count_input_samples(out_root, 'test')} -> {out_root}"
+            )
+            return
+        print(f"[断点续做] 待处理 mesh 数: {len(todo)}（已跳过 {len(entries) - len(todo)} 个完整项）")
+    else:
+        todo = list(entries)
+
     total = {"train": 0, "test": 0}
 
     _cam_to_far = float(args.hpr_sphere_r) + 1.0
@@ -324,7 +507,7 @@ def main():
         f"(max of --hpr-radius and factor*(sphere_r+1))"
     )
 
-    for file_path, cat, split in tqdm(entries, desc="Processing"):
+    for file_path, cat, split in tqdm(todo, desc="Processing"):
         mesh = _read_off_mesh(file_path)
         if not mesh.has_triangles():
             continue
@@ -415,7 +598,13 @@ def main():
                 )
                 total[split] += 1
 
-    print(f"\nDone. train={total['train']} test={total['test']} -> {out_root}")
+    print(
+        f"\nDone. 本次运行新写入样本 train={total['train']} test={total['test']} -> {out_root}"
+    )
+    print(
+        f"目录内现有 input/*.npy 计数: train={count_input_samples(out_root, 'train')} "
+        f"test={count_input_samples(out_root, 'test')}"
+    )
 
 
 if __name__ == "__main__":

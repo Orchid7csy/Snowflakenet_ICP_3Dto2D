@@ -130,13 +130,13 @@ def run_one_sample(
     cor = cor + np.random.normal(0, noise_std, cor.shape).astype(np.float32)
 
     p_corrupted = pre.density_weighted_resample(cor, camera_pos, num_obs, alpha=density_alpha)
-    gt_2048_origin = pre.resample(gt_rot, num_gt)
+    gt_resampled = pre.resample(gt_rot, num_gt)
 
     R_se3 = pre.random_rotation_matrix(se3_rot_max_deg)
     t_se3 = pre.random_translation(se3_trans_min, se3_trans_max, extent)
 
     p_obs = (p_corrupted @ R_se3.T + t_se3[None, :]).astype(np.float32)
-    gt_w = (gt_2048_origin @ R_se3.T + t_se3[None, :]).astype(np.float32)
+    gt_w = (gt_resampled @ R_se3.T + t_se3[None, :]).astype(np.float32)
 
     p_norm, C_bbox, scale = pre.normalize_by_bbox(p_obs)
     p_in, R_pca, mu_pca = pre.pca_align(p_norm, target_axis=pca_axis)
@@ -168,7 +168,12 @@ def main():
 
     ap.add_argument("--num-cad-sample", type=int, default=16384)
     ap.add_argument("--num-obs", type=int, default=2048)
-    ap.add_argument("--num-gt", type=int, default=2048)
+    ap.add_argument(
+        "--num-gt",
+        type=int,
+        default=16384,
+        help="与 01_preprocess_modelnet40 --num-gt 一致（默认 16384）",
+    )
     ap.add_argument("--min-keep", type=int, default=1024)
     ap.add_argument("--missing-rate-min", type=float, default=0.1)
     ap.add_argument("--missing-rate-max", type=float, default=0.4)

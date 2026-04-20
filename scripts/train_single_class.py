@@ -31,6 +31,11 @@ for p in [project_root, snet_root]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+import wandb_utils  # noqa: E402
+
 from src.data.dataset import SnowflakeDataset          # 你写的 Dataset
 from models.model_completion import SnowflakeNet        # 官方模型
 from loss_functions.Chamfer3D.dist_chamfer_3D import chamfer_3DDist  # 官方 Chamfer
@@ -86,9 +91,10 @@ def load_pretrained(model: SnowflakeNet, ckpt_path: str, log):
 
 
 # ── 单 epoch 训练 ──────────────────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, device, epoch, log):
+def train_one_epoch(model, loader, optimizer, device, epoch, log, global_step_start, log_every=20):
     model.train()
     total_loss = 0.0
+    global_step = global_step_start
 
     for i, (inp, gt) in enumerate(loader):
         # inp, gt: (B, N, 3)
@@ -109,32 +115,55 @@ def train_one_epoch(model, loader, optimizer, device, epoch, log):
         optimizer.step()
 
         total_loss += loss.item()
+        global_step += 1
 
-        if (i + 1) % 20 == 0:
-            log.info(f"  Epoch {epoch:03d} | step {i+1:4d}/{len(loader)} "
-                     f"| loss {loss.item():.6f}")
+        if global_step % log_every == 0:
+            lr_now = optimizer.param_groups[0]['lr']
+            log.info(
+                f"  Epoch {epoch:03d} | step {i+1:4d}/{len(loader)} "
+                f"| gstep {global_step:7d} | loss {loss.item():.6f} | lr {lr_now:.2e}"
+            )
+            wandb_utils.log_train_metrics(loss.item(), lr_now, global_step)
 
-    return total_loss / len(loader)
+    return total_loss / len(loader), global_step
 
 
 # ── 验证 ───────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def validate(model, loader, device):
+def validate(model, loader, device, log_wandb_3d=False, log_step=0):
     model.eval()
     total_cd = 0.0
+    n_batch = 0
 
-    for inp, gt in loader:
+    for i, (inp, gt) in enumerate(loader):
         inp, gt = inp.to(device), gt.to(device)
         outputs = model(inp)
-        pred    = outputs[-1]          # 只取最终输出 P3 评估
+        pred = outputs[-1]          # 只取最终输出 P3 评估
+        if log_wandb_3d and i == 0:
+            wandb_utils.log_val_pointclouds(
+                gt[0].detach().cpu().numpy(),
+                pred[0].detach().cpu().numpy(),
+                step=log_step,
+                prefix="val",
+            )
         total_cd += chamfer_l1(pred, gt).item()
+        n_batch += 1
 
-    return total_cd / len(loader)
+    model.train()
+    return total_cd / max(n_batch, 1)
 
 
 # ── 主函数 ─────────────────────────────────────────────────────────────────
 def main(args):
     log = setup_logging(args.save_dir)
+    wandb_run = wandb_utils.init_wandb(args)
+    try:
+        _run_training(args, log, wandb_run)
+    finally:
+        wandb_utils.finish_wandb(wandb_run)
+
+
+def _run_training(args, log, wandb_run):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"使用设备：{device}")
 
@@ -170,12 +199,28 @@ def main(args):
     best_cd = float('inf')
     best_path = os.path.join(args.save_dir, f'ckpt-{target_category}-best.pth')
 
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, log)
-        val_cd     = validate(model, val_loader, device)
-        
+        train_loss, global_step = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            log,
+            global_step,
+            log_every=args.log_every,
+        )
+        val_cd = validate(
+            model,
+            val_loader,
+            device,
+            log_wandb_3d=(wandb_run is not None),
+            log_step=global_step,
+        )
+
         # 根据验证集表现调整学习率
-        scheduler.step(val_cd) 
+        scheduler.step(val_cd)
 
         # 修正：从 optimizer 读取当前学习率进行打印
         curr_lr = optimizer.param_groups[0]['lr']
@@ -185,13 +230,24 @@ def main(args):
         # 保存带类别标签的最优模型
         if val_cd < best_cd:
             best_cd = val_cd
-            torch.save({'epoch': epoch, 'model': model.state_dict(), 'val_cd': val_cd}, best_path)
+            torch.save({'epoch': epoch, 'global_step': global_step, 'model': model.state_dict(), 'val_cd': val_cd}, best_path)
             log.info(f"  ✅ 新最优 [{target_category}] val_cd={best_cd:.6f}，已保存")
+
+        wandb_utils.log_wandb_scalars(
+            {
+                "epoch": epoch,
+                "train/epoch_avg_loss": train_loss,
+                "val/chamfer": val_cd,
+                "val/learning_rate": curr_lr,
+                "val/best_chamfer": best_cd,
+            },
+            global_step,
+        )
 
         # 每 10 轮保存常规备份
         if epoch % 10 == 0:
             reg_path = os.path.join(args.save_dir, f'ckpt-{target_category}-epoch{epoch:03d}.pth')
-            torch.save({'epoch': epoch, 'model': model.state_dict(), 'val_cd': val_cd}, reg_path)
+            torch.save({'epoch': epoch, 'global_step': global_step, 'model': model.state_dict(), 'val_cd': val_cd}, reg_path)
 
     log.info(f"训练结束。[{target_category}] 最优 val_cd = {best_cd:.6f}")
 
@@ -210,5 +266,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs',        type=int, default=100)
     parser.add_argument('--batch_size',    type=int, default=8)
     parser.add_argument('--lr',            type=float, default=1e-5)
+    parser.add_argument('--no-wandb', action='store_true', help='禁用 Weights & Biases')
+    parser.add_argument('--log-every', type=int, default=20, help='每 N 个 global step 记录 train 日志与 W&B')
     args = parser.parse_args()
     main(args)
