@@ -106,6 +106,8 @@ def fps_subsample_gt(gt: torch.Tensor, n: int) -> torch.Tensor:
 
 # ── 加载预训练权重（去 module. 前缀） ─────────────────────────────────
 def load_pretrained(model: SnowflakeNet, ckpt_path: str):
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"未找到预训练权重: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location='cpu')
     state_dict = checkpoint['model']
     new_sd = OrderedDict()
@@ -291,7 +293,38 @@ def _run_training(args, wandb_run):
     len_easy = len(train_loader_easy)
     len_hard = len(train_loader_hard)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    enc_keywords = ("feat_extractor", "feature", "encoder")
+    dec_keywords = ("seed_generator", "up_layers", "decoder", "refine")
+    group_a, group_b = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        ln = n.lower()
+        if any(k in ln for k in enc_keywords):
+            group_a.append(p)
+        elif any(k in ln for k in dec_keywords):
+            group_b.append(p)
+        else:
+            group_b.append(p)
+    if not group_a:
+        log.warning("未匹配到 Encoder 参数，回退：按参数名前 35%% 划为 Group A。")
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        cut = max(1, int(round(0.35 * len(all_params))))
+        group_a = all_params[:cut]
+        seen = {id(p) for p in group_a}
+        group_b = [p for p in all_params if id(p) not in seen]
+    optimizer = optim.Adam(
+        [
+            {"params": group_a, "lr": 1e-5},
+            {"params": group_b, "lr": 5e-5},
+        ],
+        weight_decay=1e-5,
+    )
+    log.info(
+        "优化器参数组: GroupA(Encoder/Feature) lr=1e-5, GroupB(Decoder/Refinement) lr=5e-5 | "
+        "nA=%d nB=%d",
+        len(group_a), len(group_b),
+    )
     scheduler_cosine = None
     scheduler_plateau = None
     if args.scheduler == "cosine":
