@@ -3,23 +3,15 @@ PCN 预处理（新 schema，与 PCN 预训练分布一致）：
   partial/complete 读入（物体系）→ 在物体系按 complete 的 AABB 中心 + max-radius 单位球
   归一化得到 canonical input/gt（不再做 PCA 重定向）→ 重采样为 input=2048 / gt=16384；
   随机 T_far 仅作用于 obs_w（用于位姿估计任务），meta 同时保存
-  canonical (C_cano/scale_cano/可选 R_aug) 与世界刚体 (R_far/t_far/T_far_4x4)。
+  canonical (centroid_cano/scale_cano/可选 R_aug) 与世界刚体 (R_far/t_far/T_far_4x4)。
 
-模式：
-  hard: 处理 PCN 中所有 partial 视角（默认，保持旧行为）。
-  easy: 每个模型只处理 01_compute_best_view.py 选出的 HPR 可见点最多视角，用作 curriculum 暖启动。
-
-用法:
-  python scripts/00_preprocess_pcn.py --pcn-root PCN --splits train,val,test
-  python scripts/01_compute_best_view.py --pcn-root PCN --splits train,val,test
-  python scripts/00_preprocess_pcn.py --pcn-root PCN --mode easy --splits train,val,test
-  # 多进程（默认 workers≈min(CPU,48)；磁盘慢时可试 --workers 16）
-  python scripts/00_preprocess_pcn.py --pcn-root PCN --mode easy --splits train --workers 32
+策略：
+  - 废弃 HPR 选择，固定使用每个模型的 8 个标准视角（view_idx ∈ [0,7]）。
+  - input 点数强制为 2048（扰动后再采样），保证与 SNet 输入契约一致。
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -75,32 +67,10 @@ def _iter_pairs(
     return out
 
 
-def _load_best_view_indices(path: Path) -> dict[tuple[str, str, str], int]:
-    with open(path, encoding="utf-8") as f:
-        payload = json.load(f)
-    by_model = payload.get("by_model") or {}
-    out: dict[tuple[str, str, str], int] = {}
-    for entry in by_model.values():
-        try:
-            key = (entry["split"], entry["synset"], entry["model_id"])
-            out[key] = int(entry["best_view_idx"])
-        except (KeyError, TypeError, ValueError):
-            continue
-    return out
-
-
-def _filter_pairs_by_best_hpr(
-    pairs: list[tuple[str, str, str, Path, Path, int]],
-    best_view_json: Path,
+def _filter_pairs_to_fixed_8_views(
+    pairs: list[tuple[str, str, str, Path, Path, int]]
 ) -> list[tuple[str, str, str, Path, Path, int]]:
-    best = _load_best_view_indices(best_view_json)
-    if not best:
-        raise ValueError(f"best-view JSON 中没有可用 by_model 条目: {best_view_json}")
-    return [
-        item
-        for item in pairs
-        if best.get((item[0], item[1], item[2])) == int(item[5])
-    ]
+    return [item for item in pairs if 0 <= int(item[5]) < 8]
 
 
 def _process_one_with_gt(
@@ -143,6 +113,7 @@ def _process_one_with_gt(
     t_far_4x4 = prep.rigid_T_4x4(r_far, t_far)
     meta = {
         "C_cano": c_cano,
+        "centroid_cano": c_cano,
         "scale_cano": np.float32(scale_cano),
         "R_aug": r_aug,
         "rot_aug_deg": np.float32(rot_aug_deg),
@@ -352,24 +323,6 @@ def main() -> int:
     )
     ap.add_argument("--pcn-root", type=str, default=os.path.join(_PROJECT_ROOT, "PCN"))
     ap.add_argument(
-        "--mode",
-        choices=("hard", "easy"),
-        default="hard",
-        help="hard=处理全部 partial；easy=仅处理 HPR 最佳视角（用于 curriculum 暖启动）",
-    )
-    ap.add_argument(
-        "--selection",
-        choices=("all", "best_hpr"),
-        default="",
-        help="覆盖 --mode 的样本选择策略；默认 hard->all，easy->best_hpr",
-    )
-    ap.add_argument(
-        "--best-view-json",
-        type=str,
-        default=os.path.join(_PROJECT_ROOT, "data", "processed", "PCN_hpr_best_views.json"),
-        help="--mode easy / --selection best_hpr 时读取的 01_compute_best_view.py 输出",
-    )
-    ap.add_argument(
         "--out-root",
         type=str,
         default="",
@@ -417,38 +370,20 @@ def main() -> int:
     )
     args = ap.parse_args()
     _sanitize_invalid_thread_env()
+    if int(args.num_input) != 2048:
+        raise ValueError("SNet 输入点数必须固定为 2048，请使用 --num-input 2048。")
 
     pcn_root = Path(args.pcn_root).resolve()
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
-    selection = args.selection or ("best_hpr" if args.mode == "easy" else "all")
     if not args.out_root:
-        name = (
-            f"PCN_hpr_easy_cano_in{args.num_input}_gt{args.num_gt}"
-            if selection == "best_hpr"
-            else f"PCN_far_cano_in{args.num_input}_gt{args.num_gt}"
-        )
+        name = f"PCN_far8_cano_in{args.num_input}_gt{args.num_gt}"
         out_root = Path(_PROJECT_ROOT, "data", "processed", name)
     else:
         out_root = Path(args.out_root).resolve()
 
     pairs = _iter_pairs(pcn_root, splits)
     n_pairs_before_selection = len(pairs)
-    if selection == "best_hpr":
-        best_view_json = Path(args.best_view_json).expanduser()
-        if not best_view_json.is_absolute():
-            best_view_json = Path(_PROJECT_ROOT, best_view_json)
-        if not best_view_json.is_file():
-            print(
-                f"错误: easy 模式需要 best-view JSON: {best_view_json}\n"
-                f"请先运行: python scripts/01_compute_best_view.py --pcn-root {pcn_root} --splits {','.join(splits)}",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            pairs = _filter_pairs_by_best_hpr(pairs, best_view_json.resolve())
-        except Exception as e:
-            print(f"错误: 读取/应用 best-view JSON 失败: {e}", file=sys.stderr)
-            return 2
+    pairs = _filter_pairs_to_fixed_8_views(pairs)
     if args.max_samples > 0:
         pairs = pairs[: args.max_samples]
 
@@ -470,11 +405,7 @@ def main() -> int:
     omp_tw = max(1, int(args.omp_threads_per_worker))
 
     n_ok, n_skip, n_fail = 0, 0, 0
-    desc = (
-        "pcn easy(best-hpr) cano+T_far"
-        if selection == "best_hpr"
-        else "pcn cano+T_far"
-    )
+    desc = "pcn fixed-8-views cano+T_far"
     if n_workers == 1:
         for key in tqdm(model_keys, desc=desc):
             ok, sk, fa, fmsgs = _run_one_model(
@@ -537,9 +468,8 @@ def main() -> int:
             f"input={args.num_input} gt={args.num_gt} t_min={args.t_min} t_max={args.t_max}\n"
         )
         f.write(
-            f"mode={args.mode} selection={selection} "
-            f"pairs_before_selection={n_pairs_before_selection} "
-            f"best_view_json={args.best_view_json}\n"
+            f"view_policy=fixed_8_views(view_idx in [0,7]) "
+            f"pairs_before_selection={n_pairs_before_selection}\n"
         )
         f.write(
             f"schema=cano rot_aug_deg={args.rot_aug_deg} rot_aug_axis={args.rot_aug_axis}\n"
