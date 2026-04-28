@@ -361,6 +361,7 @@ def main() -> int:
         choices=("fps", "random"),
         help="canonical input 与 obs_w 固定点数时的策略：FPS（默认）或无放回随机；不足 n 时仍用放回随机补齐",
     )
+    ap.add_argument("--seed", type=int, default=42, help="随机种子（T_far、重采样等）")
     ap.add_argument("--t-min", type=float, default=1.0, help="t_far 模长下界")
     ap.add_argument("--t-max", type=float, default=3.0, help="t_far 模长上界")
     ap.add_argument("--skip-existing", action="store_true")
