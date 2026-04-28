@@ -1,0 +1,16 @@
+# 仅忽略仓库根目录的 data/，勿写 `data/` 否则会匹配到 `src/data/`
+/data/
+*.off
+*.pcd
+*.ply
+*.obj
+
+# Cursor indexing
+checkpoints/**/*.log
+checkpoints/**/*.pth
+*.log
+*.db-wal
+
+Snet/
+wandb/
+PCN/

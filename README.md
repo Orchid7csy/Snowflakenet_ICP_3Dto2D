@@ -215,4 +215,4 @@ data/processed/PCN_far8_cano_in2048_gt16384/{train,val,test}/{input,gt,obs_w,met
 |------|------|
 | Gate 始终拒绝 | 检查补全质量、`--gate-fitness`、`--fpfh-voxel`、以及反归一化是否与 meta 一致 |
 | 微调 CD 不降 | 学习率组、是否加载预训练、`verify_processed_dataset` 是否全通过 |
-| pytest 收集失败 | `export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`（见 `tests/conftest.py` 注释） |
+| Cursor 里看不到 `src/data/` | `.cursorignore` 曾用 `data/` 会误匹配 `src/data/`；已改为仓库根的 `/data/`。若仍异常，以 `git ls-files src/data` 为准 |

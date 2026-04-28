@@ -13,6 +13,8 @@
 !tests/**
 !experiment/
 !experiment/**
+!.cursorignore
+!.cursorignore
 !README.md
 !pyproject.toml
 !pytest.ini
