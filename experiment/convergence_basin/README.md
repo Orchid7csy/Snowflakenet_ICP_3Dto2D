@@ -13,6 +13,7 @@
 | `run_all_checks.py` | 依次调用上述脚本（可选 `--processed-root`） |
 | `run_unit_tests.sh` | 调用仓库 `tests/`（需 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` 时见脚本注释） |
 | `compare_cd_two_ckpts.sh` | 对同一 `processed-root` 分别评测预训练与微调 checkpoint 的 CD |
+| `CURSOR_THINKING_SKIP.md` | Composer **Thinking / Skipped** 时可复制的减负 Prompt（与 `.cursor/rules/` 配套） |
 
 ## 最短用法
 
