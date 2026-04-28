@@ -1,11 +1,54 @@
 """
 PCN/ModelNet 共享：AABB 归一化、PCA 对齐、刚体、随机远距变换 T_far。
 行向量约定: p' = p @ R.T + t
+
+新管线（推荐）：``normalize_by_complete`` + 可选 ``random_gravity_axis_rot``，
+不做 PCA 重定向；canonical input/gt 与 PCN 预训练分布一致，``obs_w`` 仍带 T_far。
 """
 from __future__ import annotations
 
 import numpy as np
 import open3d as o3d
+
+
+def normalize_by_complete(
+    complete_obj: np.ndarray, partial_obj: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """以 complete 的 AABB 中心 + max-radius 单位球归一化，partial 跟随相同 (c, scale)。
+
+    返回 (partial_cano, complete_cano, c, scale)，c 形状 (3,)，scale 标量。
+    与 PCN 预训练分布一致：complete 落在以原点为心的单位球内。
+    """
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(complete_obj.astype(np.float64))
+    c = np.asarray(pcd.get_axis_aligned_bounding_box().get_center(), dtype=np.float32)
+    centered = (complete_obj - c[None, :]).astype(np.float32)
+    scale = float(max(np.linalg.norm(centered, axis=1).max(), 1e-8))
+    complete_cano = (centered / scale).astype(np.float32)
+    partial_cano = ((partial_obj.astype(np.float32) - c[None, :]) / np.float32(scale)).astype(np.float32)
+    return partial_cano, complete_cano, c, scale
+
+
+def random_gravity_axis_rot(
+    rng: np.random.Generator, max_deg: float, axis: str = "z"
+) -> np.ndarray:
+    """绕重力轴的小角度随机 SO(3) 旋转矩阵 (3x3, float32)。
+
+    angle ~ Uniform[-max_deg, +max_deg]（度）。``axis`` ∈ {x,y,z}。
+    """
+    if max_deg <= 0.0:
+        return np.eye(3, dtype=np.float32)
+    deg = float(rng.uniform(-float(max_deg), float(max_deg)))
+    a = np.deg2rad(deg)
+    ca, sa = float(np.cos(a)), float(np.sin(a))
+    ax = axis.lower()
+    if ax == "x":
+        m = np.array([[1, 0, 0], [0, ca, -sa], [0, sa, ca]], dtype=np.float64)
+    elif ax == "y":
+        m = np.array([[ca, 0, sa], [0, 1, 0], [-sa, 0, ca]], dtype=np.float64)
+    else:
+        m = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]], dtype=np.float64)
+    return m.astype(np.float32)
 
 
 def normalize_by_bbox(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
@@ -128,7 +171,33 @@ def resample_rng(points: np.ndarray, n: int, rng: np.random.Generator) -> np.nda
 
 
 def apply_inverse_normalization(p_comp: np.ndarray, meta: dict) -> np.ndarray:
-    """补全点云从 input 规范空间逆变换到 obs_w 世界系（T_far 之后、AABB+PCA 之前）。"""
+    """补全点云从 canonical input 空间逆变换到 obs_w 世界系。
+
+    新 schema（推荐）：meta 含 ``C_cano`` / ``scale_cano`` / ``R_far`` / ``t_far``
+    （可选 ``R_aug``），还原路径为
+    ``p_obj = (R_aug.T @ p_cano) * scale_cano + C_cano`` →
+    ``p_w = p_obj @ R_far.T + t_far``。
+
+    旧 schema（兼容）：meta 含 ``C_bbox`` / ``scale`` / ``R_pca`` (+ ``mu_pca``)，
+    保持原 PCA 还原行为，输出仍为 obs_w 系。
+    """
+    if "C_cano" in meta:
+        c_cano = np.asarray(meta["C_cano"], dtype=np.float32).reshape(1, 3)
+        scale_cano = float(meta["scale_cano"]) if "scale_cano" in meta else 1.0
+        r_aug = meta.get("R_aug")
+        if r_aug is None:
+            r_aug = np.eye(3, dtype=np.float32)
+        r_aug = np.asarray(r_aug, dtype=np.float64).reshape(3, 3)
+        p64 = np.asarray(p_comp, dtype=np.float64)
+        p_obj = (p64 @ r_aug) * np.float64(scale_cano) + c_cano.astype(np.float64)
+        if "R_far" in meta and "t_far" in meta:
+            r_far = np.asarray(meta["R_far"], dtype=np.float64).reshape(3, 3)
+            t_far = np.asarray(meta["t_far"], dtype=np.float64).reshape(1, 3)
+            p_w = p_obj @ r_far.T + t_far
+        else:
+            p_w = p_obj
+        return p_w.astype(np.float32)
+
     c_bbox = meta["C_bbox"].astype(np.float32).reshape(1, 3)
     scale = float(meta["scale"]) if "scale" in meta else 1.0
     r_pca = meta["R_pca"].astype(np.float32).reshape(3, 3)

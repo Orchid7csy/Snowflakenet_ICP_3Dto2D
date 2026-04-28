@@ -1,14 +1,20 @@
-
 """Snowflake 补全数据集与 PCN 旋转增强。"""
 from __future__ import annotations
 
 import os
+
 import numpy as np
 import torch
 
 
 def sample_rotation_matrix(mode: str, rng=None) -> np.ndarray:
     rng = rng or np.random.default_rng()
+    if mode == "signflip":
+        # PCA 主轴符号二义性：独立 ±1，保持 det(R)=+1（右手系）
+        s = rng.choice([-1.0, 1.0], size=3).astype(np.float32)
+        if float(np.prod(s)) < 0:
+            s[0] = -s[0]
+        return np.diag(s).astype(np.float32)
     if mode == "yaw":
         theta = float(rng.uniform(0, 2 * np.pi))
         c, s = np.cos(theta), np.sin(theta)
@@ -83,8 +89,8 @@ class PCNRotAugCompletionDataset(CompletionDataset):
         super().__init__(root_dir, split=split, input_points=input_points, gt_points=gt_points)
         self._rot_aug = bool(rot_aug) and (split == "train")
         self._rot_mode = rot_mode
-        if rot_mode not in ("so3", "yaw"):
-            raise ValueError("rot_mode 仅支持 so3 或 yaw")
+        if rot_mode not in ("so3", "yaw", "signflip"):
+            raise ValueError("rot_mode 仅支持 so3、yaw 或 signflip")
 
     def __getitem__(self, idx):
         file_name = self.file_list[idx]

@@ -5,7 +5,7 @@ T_icp：将 filtered 补全点云对齐到 obs_w。
 若需物体系位姿，可用 meta 中 T_far_4x4 与 T_icp 组合（见脚本输出说明）。
 
 用法:
-  python scripts/05_estimate_pose.py --data-root data/processed/PCN_far_in2048_gt16384 --split test \\
+  python scripts/05_estimate_pose.py --data-root data/processed/PCN_far_cano_in2048_gt16384 --split test \\
     --stem pcn__test__plane_02691156__...__view_00 --ckpt checkpoints/snet_finetune/ckpt-best.pth
 """
 from __future__ import annotations
@@ -130,7 +130,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Completion + inv-norm + ICP pose")
     parser.add_argument(
         "--data-root",
-        default=os.path.join(_PROJECT_ROOT, "data", "processed", "PCN_far_in2048_gt16384"),
+        default=os.path.join(_PROJECT_ROOT, "data", "processed", "PCN_far_cano_in2048_gt16384"),
     )
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--stem", required=True, help="样本主名，无 .npy")

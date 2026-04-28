@@ -1,17 +1,31 @@
 """
-PCN 预处理：对象系 partial/complete 读入 → 随机 T_far(远距) → 在 obs_w 上做 bbox 归一化 + PCA →
-重采样为 input=2048 / gt=16384，并保存 obs_w 与 meta（含 R_far、t_far、C_bbox、scale、R_pca、mu_pca）。
+PCN 预处理（新 schema，与 PCN 预训练分布一致）：
+  partial/complete 读入（物体系）→ 在物体系按 complete 的 AABB 中心 + max-radius 单位球
+  归一化得到 canonical input/gt（不再做 PCA 重定向）→ 重采样为 input=2048 / gt=16384；
+  随机 T_far 仅作用于 obs_w（用于位姿估计任务），meta 同时保存
+  canonical (C_cano/scale_cano/可选 R_aug) 与世界刚体 (R_far/t_far/T_far_4x4)。
+
+模式：
+  hard: 处理 PCN 中所有 partial 视角（默认，保持旧行为）。
+  easy: 每个模型只处理 01_compute_best_view.py 选出的 HPR 可见点最多视角，用作 curriculum 暖启动。
 
 用法:
   python scripts/00_preprocess_pcn.py --pcn-root PCN --splits train,val,test
+  python scripts/01_compute_best_view.py --pcn-root PCN --splits train,val,test
+  python scripts/00_preprocess_pcn.py --pcn-root PCN --mode easy --splits train,val,test
+  # 多进程（默认 workers≈min(CPU,48)；磁盘慢时可试 --workers 16）
+  python scripts/00_preprocess_pcn.py --pcn-root PCN --mode easy --splits train --workers 32
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
 import zlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +74,34 @@ def _iter_pairs(
     return out
 
 
+def _load_best_view_indices(path: Path) -> dict[tuple[str, str, str], int]:
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    by_model = payload.get("by_model") or {}
+    out: dict[tuple[str, str, str], int] = {}
+    for entry in by_model.values():
+        try:
+            key = (entry["split"], entry["synset"], entry["model_id"])
+            out[key] = int(entry["best_view_idx"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _filter_pairs_by_best_hpr(
+    pairs: list[tuple[str, str, str, Path, Path, int]],
+    best_view_json: Path,
+) -> list[tuple[str, str, str, Path, Path, int]]:
+    best = _load_best_view_indices(best_view_json)
+    if not best:
+        raise ValueError(f"best-view JSON 中没有可用 by_model 条目: {best_view_json}")
+    return [
+        item
+        for item in pairs
+        if best.get((item[0], item[1], item[2])) == int(item[5])
+    ]
+
+
 def _process_one(
     split: str,
     synset: str,
@@ -70,10 +112,11 @@ def _process_one(
     *,
     num_input: int,
     num_gt: int,
-    pca_axis: str,
     base_seed: int,
     t_min: float,
     t_max: float,
+    rot_aug_deg: float,
+    rot_aug_axis: str,
 ) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, dict]:
     stem = sample_stem(split=split, synset=synset, model_id=model_id, view=view_idx)
     rng = np.random.default_rng(
@@ -82,25 +125,28 @@ def _process_one(
 
     part_obj = read_pcd_xyz(partial_pcd)
     gt_obj = read_pcd_xyz(complete_pcd)
+
+    part_cano, gt_cano, c_cano, scale_cano = prep.normalize_by_complete(gt_obj, part_obj)
+
+    r_aug = np.eye(3, dtype=np.float32)
+    if rot_aug_deg > 0.0:
+        r_aug = prep.random_gravity_axis_rot(rng, rot_aug_deg, axis=rot_aug_axis)
+        part_cano = (part_cano @ r_aug.T).astype(np.float32)
+        gt_cano = (gt_cano @ r_aug.T).astype(np.float32)
+
     r_far, t_far, t_norm = prep.sample_random_far_transform(rng, t_min, t_max)
     obs_w = prep.apply_rigid_row(part_obj, r_far, t_far)
-    gt_w = prep.apply_rigid_row(gt_obj, r_far, t_far)
 
-    p_norm, c_bbox, scale = prep.normalize_by_bbox(obs_w)
-    p_in, r_pca, mu_pca = prep.pca_align(p_norm, target_axis=pca_axis)
-    gt_norm = ((gt_w - c_bbox[None, :]) / np.float32(scale)).astype(np.float32)
-    gt_out = prep.apply_pca_rigid(gt_norm, r_pca, mu_pca)
-
-    p_rs = prep.resample_rng(p_in, num_input, rng)
-    g_rs = prep.resample_rng(gt_out, num_gt, rng)
+    p_rs = prep.resample_rng(part_cano, num_input, rng)
+    g_rs = prep.resample_rng(gt_cano, num_gt, rng)
     obs_rs = prep.resample_rng(obs_w, num_input, rng)
     t_far_4x4 = prep.rigid_T_4x4(r_far, t_far)
     meta = {
-        "C_bbox": c_bbox,
-        "scale": np.float32(scale),
-        "R_pca": r_pca,
-        "mu_pca": mu_pca,
-        "pca_axis": pca_axis,
+        "C_cano": c_cano,
+        "scale_cano": np.float32(scale_cano),
+        "R_aug": r_aug,
+        "rot_aug_deg": np.float32(rot_aug_deg),
+        "rot_aug_axis": rot_aug_axis,
         "split": split,
         "synset": synset,
         "model_id": model_id,
@@ -115,37 +161,252 @@ def _process_one(
     return stem, p_rs, g_rs, obs_rs, meta
 
 
+def _sanitize_invalid_thread_env() -> None:
+    """去掉空串/0/非整数等非法值，避免 libgomp 报 Invalid OMP_NUM_THREADS。"""
+    keys = (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_NUM_THREADS",
+    )
+    for k in keys:
+        v = os.environ.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            del os.environ[k]
+            continue
+        try:
+            n = int(float(s.split(",")[0].strip()))
+        except ValueError:
+            del os.environ[k]
+            continue
+        if n < 1:
+            del os.environ[k]
+
+
+def _limit_blas_omp_threads(n: int) -> None:
+    s = str(max(1, int(n)))
+    for k in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[k] = s
+
+
+def _pool_init_threads(omp_threads: int) -> None:
+    _sanitize_invalid_thread_env()
+    _limit_blas_omp_threads(max(1, int(omp_threads)))
+
+
+def _run_one_pair(
+    item: tuple[str, str, str, Path, Path, int],
+    out_root: Path,
+    *,
+    num_input: int,
+    num_gt: int,
+    base_seed: int,
+    t_min: float,
+    t_max: float,
+    rot_aug_deg: float,
+    rot_aug_axis: str,
+    skip_existing: bool,
+    no_meta: bool,
+) -> tuple[str, str]:
+    """处理单条样本：必要时计算并落盘。返回 (status, message)，status ∈ ok|skip|fail。"""
+    split, synset, model_id, pp, gp, view_idx = item
+    stem = sample_stem(split=split, synset=synset, model_id=model_id, view=view_idx)
+
+    idir = out_root / split / "input"
+    gdir = out_root / split / "gt"
+    odir = out_root / split / "obs_w"
+    mdir = out_root / split / "meta"
+    for d in (idir, gdir, odir):
+        d.mkdir(parents=True, exist_ok=True)
+    if not no_meta:
+        mdir.mkdir(parents=True, exist_ok=True)
+
+    ip = idir / f"{stem}.npy"
+    gpout = gdir / f"{stem}.npy"
+    op = odir / f"{stem}.npy"
+    mp = mdir / f"{stem}.npz"
+
+    if skip_existing and ip.is_file() and gpout.is_file() and op.is_file():
+        return ("skip", "")
+
+    try:
+        _stem, pin, gto, obw, meta = _process_one(
+            split,
+            synset,
+            model_id,
+            pp,
+            gp,
+            view_idx,
+            num_input=num_input,
+            num_gt=num_gt,
+            base_seed=base_seed,
+            t_min=t_min,
+            t_max=t_max,
+            rot_aug_deg=rot_aug_deg,
+            rot_aug_axis=rot_aug_axis,
+        )
+    except Exception as e:
+        return ("fail", f"{pp}: {e}")
+    if _stem != stem:
+        return ("fail", f"internal stem mismatch: {_stem!r} vs {stem!r}")
+
+    try:
+        np.save(str(ip), pin.astype(np.float32))
+        np.save(str(gpout), gto.astype(np.float32))
+        np.save(str(op), obw.astype(np.float32))
+        if not no_meta:
+            np.savez(str(mp), **meta)
+    except Exception as e:
+        return ("fail", f"save {stem}: {e}")
+    return ("ok", "")
+
+
+def _mp_item_to_tuple(
+    item: tuple[str, str, str, Path, Path, int],
+) -> tuple[str, str, str, str, str, int]:
+    split, synset, model_id, pp, gp, view_idx = item
+    return (split, synset, model_id, str(pp), str(gp), view_idx)
+
+
+def _mp_worker(
+    packed: tuple[str, str, str, str, str, int],
+    cfg: dict[str, object],
+) -> tuple[str, str]:
+    item = (
+        packed[0],
+        packed[1],
+        packed[2],
+        Path(packed[3]),
+        Path(packed[4]),
+        int(packed[5]),
+    )
+    return _run_one_pair(
+        item,
+        Path(str(cfg["out_root"])),
+        num_input=int(cfg["num_input"]),
+        num_gt=int(cfg["num_gt"]),
+        base_seed=int(cfg["base_seed"]),
+        t_min=float(cfg["t_min"]),
+        t_max=float(cfg["t_max"]),
+        rot_aug_deg=float(cfg["rot_aug_deg"]),
+        rot_aug_axis=str(cfg["rot_aug_axis"]),
+        skip_existing=bool(cfg["skip_existing"]),
+        no_meta=bool(cfg["no_meta"]),
+    )
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="PCN：T_far + bbox+PCA → input/gt/obs_w + meta")
+    ap = argparse.ArgumentParser(
+        description="PCN：按 complete 归一化的 canonical input/gt + T_far→obs_w + meta"
+    )
     ap.add_argument("--pcn-root", type=str, default=os.path.join(_PROJECT_ROOT, "PCN"))
+    ap.add_argument(
+        "--mode",
+        choices=("hard", "easy"),
+        default="hard",
+        help="hard=处理全部 partial；easy=仅处理 HPR 最佳视角（用于 curriculum 暖启动）",
+    )
+    ap.add_argument(
+        "--selection",
+        choices=("all", "best_hpr"),
+        default="",
+        help="覆盖 --mode 的样本选择策略；默认 hard->all，easy->best_hpr",
+    )
+    ap.add_argument(
+        "--best-view-json",
+        type=str,
+        default=os.path.join(_PROJECT_ROOT, "data", "processed", "PCN_hpr_best_views.json"),
+        help="--mode easy / --selection best_hpr 时读取的 01_compute_best_view.py 输出",
+    )
     ap.add_argument(
         "--out-root",
         type=str,
         default="",
-        help="默认: data/processed/PCN_far_in{input}_gt{gt}/",
+        help="默认 hard: data/processed/PCN_far_cano_in{input}_gt{gt}/；"
+             "easy: data/processed/PCN_hpr_easy_cano_in{input}_gt{gt}/",
     )
     ap.add_argument("--splits", type=str, default="train,val,test")
     ap.add_argument("--num-input", type=int, default=2048)
     ap.add_argument("--num-gt", type=int, default=16384)
-    ap.add_argument("--pca-axis", default="z", choices=("x", "y", "z"))
+    ap.add_argument(
+        "--pca-axis",
+        default="z",
+        choices=("x", "y", "z"),
+        help="[deprecated] 新管线不做 PCA，仅占位兼容旧命令；忽略",
+    )
+    ap.add_argument(
+        "--rot-aug-deg",
+        type=float,
+        default=0.0,
+        help="canonical 系内绕重力轴的随机小角度（度）；0 表示关闭",
+    )
+    ap.add_argument(
+        "--rot-aug-axis",
+        default="z",
+        choices=("x", "y", "z"),
+        help="--rot-aug-deg 对应的重力轴",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--t-min", type=float, default=1.0, help="t_far 模长下界")
     ap.add_argument("--t-max", type=float, default=3.0, help="t_far 模长上界")
     ap.add_argument("--skip-existing", action="store_true")
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--no-meta", action="store_true")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="并行进程数；0=自动（约 min(CPU 核数, 48)）；1=串行无进程池",
+    )
+    ap.add_argument(
+        "--omp-threads-per-worker",
+        type=int,
+        default=1,
+        help="每个子进程内 OpenMP/BLAS 等线程上限；多进程时建议保持为 1",
+    )
     args = ap.parse_args()
+    _sanitize_invalid_thread_env()
 
     pcn_root = Path(args.pcn_root).resolve()
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
+    selection = args.selection or ("best_hpr" if args.mode == "easy" else "all")
     if not args.out_root:
-        out_root = Path(
-            _PROJECT_ROOT, "data", "processed", f"PCN_far_in{args.num_input}_gt{args.num_gt}"
+        name = (
+            f"PCN_hpr_easy_cano_in{args.num_input}_gt{args.num_gt}"
+            if selection == "best_hpr"
+            else f"PCN_far_cano_in{args.num_input}_gt{args.num_gt}"
         )
+        out_root = Path(_PROJECT_ROOT, "data", "processed", name)
     else:
         out_root = Path(args.out_root).resolve()
 
     pairs = _iter_pairs(pcn_root, splits)
+    n_pairs_before_selection = len(pairs)
+    if selection == "best_hpr":
+        best_view_json = Path(args.best_view_json).expanduser()
+        if not best_view_json.is_absolute():
+            best_view_json = Path(_PROJECT_ROOT, best_view_json)
+        if not best_view_json.is_file():
+            print(
+                f"错误: easy 模式需要 best-view JSON: {best_view_json}\n"
+                f"请先运行: python scripts/01_compute_best_view.py --pcn-root {pcn_root} --splits {','.join(splits)}",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            pairs = _filter_pairs_by_best_hpr(pairs, best_view_json.resolve())
+        except Exception as e:
+            print(f"错误: 读取/应用 best-view JSON 失败: {e}", file=sys.stderr)
+            return 2
     if args.max_samples > 0:
         pairs = pairs[: args.max_samples]
 
@@ -153,51 +414,78 @@ def main() -> int:
         print("无 (partial, complete) 对", file=sys.stderr)
         return 1
 
+    cpu_n = os.cpu_count() or 1
+    if int(args.workers) <= 0:
+        n_workers = max(1, min(cpu_n, 48))
+    else:
+        n_workers = max(1, int(args.workers))
+    omp_tw = max(1, int(args.omp_threads_per_worker))
+
     n_ok, n_skip, n_fail = 0, 0, 0
-    for item in tqdm(pairs, desc="pcn T_far+bbox+pca"):
-        split, synset, model_id, pp, gp, view_idx = item
-        try:
-            stem, pin, gto, obw, meta = _process_one(
-                split, synset, model_id, pp, gp, view_idx,
+    desc = (
+        "pcn easy(best-hpr) cano+T_far"
+        if selection == "best_hpr"
+        else "pcn cano+T_far"
+    )
+    if n_workers == 1:
+        for item in tqdm(pairs, desc=desc):
+            status, msg = _run_one_pair(
+                item,
+                out_root,
                 num_input=args.num_input,
                 num_gt=args.num_gt,
-                pca_axis=args.pca_axis,
                 base_seed=args.seed,
                 t_min=args.t_min,
                 t_max=args.t_max,
+                rot_aug_deg=float(args.rot_aug_deg),
+                rot_aug_axis=str(args.rot_aug_axis),
+                skip_existing=bool(args.skip_existing),
+                no_meta=bool(args.no_meta),
             )
-        except Exception as e:
-            n_fail += 1
-            print(f"\n[fail] {pp}: {e}", file=sys.stderr)
-            continue
-
-        idir = out_root / split / "input"
-        gdir = out_root / split / "gt"
-        odir = out_root / split / "obs_w"
-        mdir = out_root / split / "meta"
-        for d in (idir, gdir, odir):
-            d.mkdir(parents=True, exist_ok=True)
-        if not args.no_meta:
-            mdir.mkdir(parents=True, exist_ok=True)
-
-        ip = idir / f"{stem}.npy"
-        gpout = gdir / f"{stem}.npy"
-        op = odir / f"{stem}.npy"
-        mp = mdir / f"{stem}.npz"
-
-        if args.skip_existing and ip.is_file() and gpout.is_file() and op.is_file():
-            n_skip += 1
-            continue
-        try:
-            np.save(str(ip), pin.astype(np.float32))
-            np.save(str(gpout), gto.astype(np.float32))
-            np.save(str(op), obw.astype(np.float32))
-            if not args.no_meta:
-                np.savez(str(mp), **meta)
-            n_ok += 1
-        except Exception as e:
-            n_fail += 1
-            print(f"\n[fail] save {stem}: {e}", file=sys.stderr)
+            if status == "ok":
+                n_ok += 1
+            elif status == "skip":
+                n_skip += 1
+            else:
+                n_fail += 1
+                if msg:
+                    print(f"\n[fail] {msg}", file=sys.stderr)
+    else:
+        cfg_dict: dict[str, object] = {
+            "out_root": str(out_root),
+            "num_input": int(args.num_input),
+            "num_gt": int(args.num_gt),
+            "base_seed": int(args.seed),
+            "t_min": float(args.t_min),
+            "t_max": float(args.t_max),
+            "rot_aug_deg": float(args.rot_aug_deg),
+            "rot_aug_axis": str(args.rot_aug_axis),
+            "skip_existing": bool(args.skip_existing),
+            "no_meta": bool(args.no_meta),
+        }
+        mp_items = [_mp_item_to_tuple(it) for it in pairs]
+        n_task = len(mp_items)
+        worker_fn = partial(_mp_worker, cfg=cfg_dict)
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_pool_init_threads,
+            initargs=(omp_tw,),
+        ) as ex:
+            futures = [ex.submit(worker_fn, it) for it in mp_items]
+            for fut in tqdm(
+                as_completed(futures),
+                total=n_task,
+                desc=f"{desc} [{n_workers}w]",
+            ):
+                status, msg = fut.result()
+                if status == "ok":
+                    n_ok += 1
+                elif status == "skip":
+                    n_skip += 1
+                else:
+                    n_fail += 1
+                    if msg:
+                        print(f"\n[fail] {msg}", file=sys.stderr)
 
     manifest = out_root / "00_preprocess_pcn_manifest.txt"
     with open(manifest, "w", encoding="utf-8") as f:
@@ -205,6 +493,17 @@ def main() -> int:
         f.write(
             f"ok={n_ok} skip={n_skip} fail={n_fail} pairs={len(pairs)} "
             f"input={args.num_input} gt={args.num_gt} t_min={args.t_min} t_max={args.t_max}\n"
+        )
+        f.write(
+            f"mode={args.mode} selection={selection} "
+            f"pairs_before_selection={n_pairs_before_selection} "
+            f"best_view_json={args.best_view_json}\n"
+        )
+        f.write(
+            f"schema=cano rot_aug_deg={args.rot_aug_deg} rot_aug_axis={args.rot_aug_axis}\n"
+        )
+        f.write(
+            f"workers={n_workers} omp_threads_per_worker={omp_tw} cpu_count={cpu_n}\n"
         )
     print(f"完成: 写入 {n_ok}, 跳过 {n_skip}, 失败 {n_fail} / {len(pairs)}. 输出: {out_root}\n摘要: {manifest}")
     return 0 if n_fail == 0 else 2
