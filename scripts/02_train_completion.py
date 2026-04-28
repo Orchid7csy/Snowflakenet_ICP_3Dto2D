@@ -19,6 +19,7 @@ SnowflakeNet 微调脚本（与原 PCN/SnowflakeNet 实验对齐版本）
     python scripts/02_train_completion.py
 
 W&B：默认 project=`SnowflakeNet_Finetune`，可用环境变量 `WANDB_*` 配置；`--no-wandb` 仅保留本地日志与 checkpoint。
+新版 `wandb_v1_*` API key 需 wandb 包 ≥0.22.3（`pip install -U 'wandb>=0.22.3'`），否则会报「API key must be 40 characters」。
 """
 
 import argparse

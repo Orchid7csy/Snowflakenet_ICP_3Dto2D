@@ -37,9 +37,21 @@ def init_wandb(
     except ImportError:
         log.warning("wandb is not installed; `pip install wandb` to enable W&B.")
         return None
+
     cfg = namespace_to_wandb_config(args)
-    run = wandb.init(project=project, config=cfg, job_type=job_type)
-    return run
+    try:
+        return wandb.init(project=project, config=cfg, job_type=job_type)
+    except ValueError as e:
+        err = str(e)
+        if "40 characters" in err or "API key" in err.lower():
+            log.error(
+                "W&B API key was rejected. New keys (`wandb_v1_*`, longer than 40 chars) require "
+                "wandb SDK 0.22.3 or newer. Upgrade with:\n"
+                "    pip install -U 'wandb>=0.22.3'\n"
+                "Or train without logging:\n"
+                "    python scripts/02_train_completion.py --no-wandb"
+            )
+        raise
 
 
 def log_wandb_scalars(metrics: dict, step: int) -> None:

@@ -11,6 +11,9 @@ dependencies = [
   "open3d",
 ]
 
+[project.optional-dependencies]
+wandb = ["wandb>=0.22.3"]
+
 [tool.ruff]
 line-length = 100
 src = ["src", "scripts"]
