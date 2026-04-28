@@ -9,6 +9,11 @@
 !src/**
 !scripts/
 !scripts/**
+!tests/
+!tests/**
+!README.md
+!pyproject.toml
+!pytest.ini
 
 # 常见：Python 生成文件（即便在 src/scripts 内也应忽略）
 **/__pycache__/

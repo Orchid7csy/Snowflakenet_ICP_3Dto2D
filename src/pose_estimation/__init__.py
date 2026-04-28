@@ -36,6 +36,8 @@ def register_point_cloud_pair(
     icp_correspondence_distance: Optional[float] = None,
     icp_mode: str = "point_to_plane",
     icp_max_iteration: int = 30,
+    ransac_max_iterations: int = 200_000,
+    ransac_confidence: int = 1000,
 ) -> FpfhIcpResult:
     """
     对两组点云做 FPFH+RANSAC 粗配准，再 ICP 精配准。
@@ -54,7 +56,13 @@ def register_point_cloud_pair(
     tgt_down, tgt_fpfh = voxel_downsample_with_fpfh(tgt_pcd, voxel_size)
 
     ransac = global_registration_fpfh_ransac(
-        src_down, tgt_down, src_fpfh, tgt_fpfh, voxel_size
+        src_down,
+        tgt_down,
+        src_fpfh,
+        tgt_fpfh,
+        voxel_size,
+        max_iterations=int(ransac_max_iterations),
+        confidence=int(ransac_confidence),
     )
 
     icp_dist = (

@@ -6,10 +6,25 @@ FPFH 特征与基于 RANSAC 的全局配准（粗对齐）。
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import open3d as o3d
+
+
+def _registration_api():
+    """
+    Open3D API 兼容层：
+    - 新版 (>=0.10): ``o3d.pipelines.registration``
+    - 旧版 (0.9):    ``o3d.registration``
+    """
+    if hasattr(o3d, "pipelines") and hasattr(o3d.pipelines, "registration"):
+        return o3d.pipelines.registration
+    if hasattr(o3d, "registration"):
+        return o3d.registration
+    raise AttributeError(
+        "Open3D 中未找到 registration API（既无 pipelines.registration 也无 registration）"
+    )
 
 
 def numpy_to_point_cloud(points: np.ndarray) -> o3d.geometry.PointCloud:
@@ -29,7 +44,7 @@ def voxel_downsample_with_fpfh(
     fpfh_radius: Optional[float] = None,
     max_nn_normal: int = 30,
     max_nn_fpfh: int = 100,
-) -> Tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
+) -> Tuple[o3d.geometry.PointCloud, Any]:
     """
     体素下采样，估计法向，计算 FPFH。
 
@@ -38,6 +53,7 @@ def voxel_downsample_with_fpfh(
     if voxel_size <= 0:
         raise ValueError("voxel_size 必须为正数")
 
+    reg = _registration_api()
     pcd_down = pcd.voxel_down_sample(voxel_size)
     if len(pcd_down.points) < 10:
         raise ValueError(f"下采样后点数过少 ({len(pcd_down.points)})，请减小 voxel_size")
@@ -48,7 +64,7 @@ def voxel_downsample_with_fpfh(
     pcd_down.estimate_normals(
         o3d.geometry.KDTreeSearchParamHybrid(radius=nr, max_nn=max_nn_normal)
     )
-    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+    fpfh = reg.compute_fpfh_feature(
         pcd_down,
         o3d.geometry.KDTreeSearchParamHybrid(radius=fr, max_nn=max_nn_fpfh),
     )
@@ -58,41 +74,57 @@ def voxel_downsample_with_fpfh(
 def global_registration_fpfh_ransac(
     source_down: o3d.geometry.PointCloud,
     target_down: o3d.geometry.PointCloud,
-    source_fpfh: o3d.pipelines.registration.Feature,
-    target_fpfh: o3d.pipelines.registration.Feature,
+    source_fpfh: Any,
+    target_fpfh: Any,
     voxel_size: float,
     mutual_filter: bool = True,
     ransac_n: int = 4,
     max_iterations: int = 4_000_000,
     confidence: int = 500,
     edge_length_ratio: float = 0.9,
-) -> o3d.pipelines.registration.RegistrationResult:
+) -> Any:
     """
     基于 FPFH 描述子匹配的 RANSAC，得到 source -> target 的刚体初值。
 
     返回的 transformation 作用在 source 上：p_target ≈ R @ p_source + t。
     """
+    reg = _registration_api()
     distance_threshold = voxel_size * 1.5
 
     checkers = [
-        o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(edge_length_ratio),
-        o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
+        reg.CorrespondenceCheckerBasedOnEdgeLength(edge_length_ratio),
+        reg.CorrespondenceCheckerBasedOnDistance(distance_threshold),
     ]
-    criteria = o3d.pipelines.registration.RANSACConvergenceCriteria(
-        max_iterations, confidence
-    )
-    estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(False)
+    # 旧版 (o3d 0.9) RANSACConvergenceCriteria 只收 (max_iteration, max_validation)，
+    # 且 registration_ransac_based_on_feature_matching 签名不含 ``mutual_filter``。
+    is_new_api = hasattr(o3d, "pipelines") and hasattr(o3d.pipelines, "registration")
+    estimation = reg.TransformationEstimationPointToPoint(False)
 
-    result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        source_down,
-        target_down,
-        source_fpfh,
-        target_fpfh,
-        mutual_filter,
-        distance_threshold,
-        estimation,
-        ransac_n,
-        checkers,
-        criteria,
-    )
+    if is_new_api:
+        criteria = reg.RANSACConvergenceCriteria(max_iterations, confidence)
+        result = reg.registration_ransac_based_on_feature_matching(
+            source_down,
+            target_down,
+            source_fpfh,
+            target_fpfh,
+            mutual_filter,
+            distance_threshold,
+            estimation,
+            ransac_n,
+            checkers,
+            criteria,
+        )
+    else:
+        criteria = reg.RANSACConvergenceCriteria(max_iterations, confidence)
+        result = reg.registration_ransac_based_on_feature_matching(
+            source_down,
+            target_down,
+            source_fpfh,
+            target_fpfh,
+            distance_threshold,
+            estimation,
+            ransac_n,
+            checkers,
+            criteria,
+        )
     return result

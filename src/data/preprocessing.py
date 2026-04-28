@@ -1,0 +1,137 @@
+"""
+PCN/ModelNet 共享：AABB 归一化、PCA 对齐、刚体、随机远距变换 T_far。
+行向量约定: p' = p @ R.T + t
+"""
+from __future__ import annotations
+
+import numpy as np
+import open3d as o3d
+
+
+def normalize_by_bbox(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Center + scale: AABB center, then max distance = 1."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    c = np.asarray(pcd.get_axis_aligned_bounding_box().get_center(), dtype=np.float32)
+    centered = (points - c[None, :]).astype(np.float32)
+    scale = float(max(np.linalg.norm(centered, axis=1).max(), 1e-8))
+    return (centered / scale).astype(np.float32), c, scale
+
+
+def _orthonormal_frame(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    v = v / n
+    tmp = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(v, tmp)) > 0.9:
+        tmp = np.array([0.0, 1.0, 0.0])
+    e2 = np.cross(v, tmp)
+    e2 /= np.linalg.norm(e2) + 1e-12
+    e3 = np.cross(v, e2)
+    return np.stack([v, e2, e3], axis=1)
+
+
+def pca_align(
+    points: np.ndarray, target_axis: str = "z", min_ratio: float = 1e-4
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pcd = o3d.geometry.PointCloud()
+    pts = points.astype(np.float64)
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    mu, cov = pcd.compute_mean_and_covariance()
+    mu = np.asarray(mu, dtype=np.float64).reshape(3)
+    cov = np.asarray(cov, dtype=np.float64).reshape(3, 3)
+
+    evals, evecs = np.linalg.eigh(cov)
+    order = np.argsort(evals)[::-1]
+    lam1 = float(evals[order[0]])
+    lam2 = float(evals[order[1]]) if len(order) > 1 else 0.0
+    if lam1 < 1e-12 or (lam1 - lam2) / (lam1 + 1e-12) < min_ratio:
+        return pts.astype(np.float32), np.eye(3, dtype=np.float32), mu.astype(np.float32)
+
+    v_main = evecs[:, order[0]].astype(np.float64)
+    v_main /= np.linalg.norm(v_main) + 1e-12
+    target_map = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
+    target = np.array(target_map[target_axis.lower()], dtype=np.float64)
+    if np.dot(v_main, target) < 0:
+        v_main = -v_main
+
+    b = _orthonormal_frame(v_main)
+    t = _orthonormal_frame(target)
+    r = t @ b.T
+    if np.linalg.det(r) < 0:
+        t[:, 1] *= -1.0
+        r = t @ b.T
+    aligned = ((r @ (pts - mu).T).T + mu).astype(np.float32)
+    return aligned, r.astype(np.float32), mu.astype(np.float32)
+
+
+def apply_pca_rigid(points: np.ndarray, r: np.ndarray, mu: np.ndarray) -> np.ndarray:
+    pts = points.astype(np.float64)
+    r64, mu64 = r.astype(np.float64), mu.astype(np.float64).reshape(1, 3)
+    return ((r64 @ (pts - mu64).T).T + mu64).astype(np.float32)
+
+
+def inverse_pca(
+    points_aligned: np.ndarray, r_pca: np.ndarray, mu_pca: np.ndarray
+) -> np.ndarray:
+    r = np.asarray(r_pca, dtype=np.float64).reshape(3, 3)
+    mu = np.asarray(mu_pca, dtype=np.float64).reshape(1, 3)
+    x = np.asarray(points_aligned, dtype=np.float64) - mu
+    return ((r.T @ x.T).T + mu).astype(np.float32)
+
+
+def sample_random_far_transform(
+    rng: np.random.Generator,
+    t_min: float,
+    t_max: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    a = rng.standard_normal((3, 3)).astype(np.float64)
+    q, _r = np.linalg.qr(a)
+    if np.linalg.det(q) < 0:
+        q[:, 0] *= -1.0
+    r = q.astype(np.float32)
+    v = rng.standard_normal(3)
+    v = (v / (np.linalg.norm(v) + 1e-12)).astype(np.float64)
+    mag = float(rng.uniform(float(t_min), float(t_max)))
+    t = (v * mag).astype(np.float32)
+    return r, t, mag
+
+
+def apply_rigid_row(
+    points: np.ndarray, r: np.ndarray, t: np.ndarray
+) -> np.ndarray:
+    p = points.astype(np.float32)
+    rr = r.astype(np.float32).reshape(3, 3)
+    tt = t.astype(np.float32).reshape(1, 3)
+    return (p @ rr.T + tt).astype(np.float32)
+
+
+def rigid_T_4x4(r: np.ndarray, t: np.ndarray) -> np.ndarray:
+    t3 = np.asarray(t, dtype=np.float64).reshape(3)
+    rr = np.asarray(r, dtype=np.float64).reshape(3, 3)
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = rr.T
+    out[:3, 3] = t3
+    return out
+
+
+def resample_rng(points: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
+    if points.shape[0] == 0:
+        return np.zeros((n, 3), dtype=np.float32)
+    if points.shape[0] >= n:
+        idx = rng.choice(points.shape[0], n, replace=False)
+    else:
+        idx = rng.choice(points.shape[0], n, replace=True)
+    return points[idx].astype(np.float32)
+
+
+def apply_inverse_normalization(p_comp: np.ndarray, meta: dict) -> np.ndarray:
+    """补全点云从 input 规范空间逆变换到 obs_w 世界系（T_far 之后、AABB+PCA 之前）。"""
+    c_bbox = meta["C_bbox"].astype(np.float32).reshape(1, 3)
+    scale = float(meta["scale"]) if "scale" in meta else 1.0
+    r_pca = meta["R_pca"].astype(np.float32).reshape(3, 3)
+    mu_pca = meta.get("mu_pca", np.zeros(3, dtype=np.float32)).astype(np.float32).reshape(3)
+    p_norm = inverse_pca(p_comp, r_pca, mu_pca)
+    return (p_norm * scale + c_bbox).astype(np.float32)

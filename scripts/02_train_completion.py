@@ -12,7 +12,7 @@ SnowflakeNet 微调脚本（与原 PCN/SnowflakeNet 实验对齐版本）
 
 注意：
   - 必须重新预处理（gt 目录里的 .npy 必须是 16384 点）。运行
-        python scripts/01_preprocess_modelnet40.py --num-gt 16384
+        python scripts/00_preprocess_pcn.py
     （脚本默认值已改为 16384）。
 
 用法：
@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader
 # ── 路径设置 ────────────────────────────────────────────────────────────
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 snet_root = os.path.join(project_root, 'Snet', 'SnowflakeNet-main')
-log_dir = '/home/csy/SnowflakeNet_FPFH_ICP/checkpoints/snet_finetune'
+log_dir = os.path.join(project_root, 'checkpoints', 'snet_finetune')
 os.makedirs(log_dir, exist_ok=True)
 for p in [project_root, snet_root]:
     if p not in sys.path:
@@ -46,7 +46,8 @@ if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 import wandb_utils  # noqa: E402
 
-from src.data.dataset import SnowflakeDataset
+from src.models.chamfer import chamfer_l1_symmetric  # noqa: E402
+from src.data.pcn_dataset import PCNRotAugCompletionDataset, CompletionDataset  # noqa: E402
 from models.model_completion import SnowflakeNet
 from loss_functions.Chamfer3D.dist_chamfer_3D import chamfer_3DDist
 
@@ -70,15 +71,8 @@ logging.getLogger().addHandler(file_handler)
 log = logging.getLogger(__name__)
 
 
-# ── Chamfer Distance L1（与官方预训练一致） ───────────────────────────
+# ── Chamfer Distance L1（与 Snet test / 表 1 一致：(d1̄+d2̄)/2，见 snet_pcn_chamfer） ─
 _chamfer_fn = chamfer_3DDist()
-
-
-def chamfer_l1(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """对称 L1 CD。pred/gt: (B, N, 3) / (B, M, 3)。"""
-    dist1, dist2, _, _ = _chamfer_fn(pred, gt)
-    cd = ((dist1 + 1e-8).sqrt().mean(dim=1) + (dist2 + 1e-8).sqrt().mean(dim=1)).mean()
-    return cd
 
 
 def random_subsample_gt(gt: torch.Tensor, n: int) -> torch.Tensor:
@@ -92,24 +86,6 @@ def random_subsample_gt(gt: torch.Tensor, n: int) -> torch.Tensor:
     else:
         idx = torch.stack([torch.randperm(M, device=gt.device)[:n] for _ in range(B)], dim=0)
     return torch.gather(gt, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-
-
-# ── Dataset 包装：input / gt 不同点数（不修改 src/data/dataset.py） ─────
-class CompletionDataset(SnowflakeDataset):
-    """与 PCN/SnowflakeNet 原实验一致：input=2048, gt=16384"""
-
-    def __init__(self, root_dir, split='train', input_points=2048, gt_points=16384):
-        super().__init__(root_dir, split=split, num_points=input_points)
-        self._gt_points = int(gt_points)
-        self._input_points = int(input_points)
-
-    def __getitem__(self, idx):
-        file_name = self.file_list[idx]
-        input_pcd = np.load(os.path.join(self.input_path, file_name))
-        gt_pcd = np.load(os.path.join(self.gt_path, file_name))
-        input_pcd = self._resample(input_pcd, self._input_points)
-        gt_pcd = self._resample(gt_pcd, self._gt_points)
-        return torch.from_numpy(input_pcd).float(), torch.from_numpy(gt_pcd).float()
 
 
 # ── 加载预训练权重（去 module. 前缀） ─────────────────────────────────
@@ -126,18 +102,36 @@ def load_pretrained(model: SnowflakeNet, ckpt_path: str):
     log.info(f"预训练权重加载成功：{ckpt_path}")
 
 
-# ── per-stage same-resolution Chamfer ──────────────────────────────────
-def staged_loss(outputs, gt: torch.Tensor, weights):
-    """对每个 stage 用相同点数的 GT 子采样后计算 CD。
-    outputs: list[Tensor] (B, N_i, 3)。weights 长度需与 outputs 一致。"""
+# ── per-stage same-resolution Chamfer + Preservation Loss ─────────────
+def staged_loss(outputs, gt: torch.Tensor, inp: torch.Tensor, weights, lambda_pres: float = 0.0):
+    """
+    返回 (total_loss, loss_completion, loss_preservation)。
+
+    - loss_completion: 各 stage (Pc/P1/P2/P3) 与同分辨率 GT 的**对称** L1 CD 加权和。
+    - loss_preservation: SnowflakeNet §3.4 的 **保真（partial matching）损失**——官方实现
+      (``completion/utils/loss_util.py::Completionloss.chamfer_partial_l1``) 调用
+      ``chamfer_dist(partial, P3)`` 并对 **第一方向距离** 取 ``mean(sqrt(dist1))``，即
+      「对每个残缺输入点，找其在最终输出 P3 中的最近点」。这是**单向**约束：强制 P3
+      覆盖所有已观测点，避免模型回归到数据集平均形状。**不要反向**（那会把 P3 拉向
+      稀疏输入）。官方总 loss 中该项权重为 1.0，这里通过 ``lambda_pres`` 可配。
+    """
     losses = []
     for w, out in zip(weights, outputs):
         if w == 0.0:
             continue
         n = out.shape[1]
         gt_sub = random_subsample_gt(gt, n)
-        losses.append(w * chamfer_l1(out, gt_sub))
-    return sum(losses)
+        losses.append(w * chamfer_l1_symmetric(out, gt_sub))
+    loss_completion = sum(losses) if losses else torch.zeros((), device=gt.device)
+
+    # 保真项：对 (inp, P3) 求 chamfer，取 dist1（每个 inp 点到最近 P3 的距离）
+    # 的 sqrt().mean()，与官方 chamfer_partial_l1(partial, P3) 完全一致。
+    p3 = outputs[-1]
+    dist1, _dist2, _, _ = _chamfer_fn(inp, p3)
+    loss_preservation = (dist1 + 1e-8).sqrt().mean()
+
+    total = loss_completion + float(lambda_pres) * loss_preservation
+    return total, loss_completion, loss_preservation
 
 
 # ── 验证 ────────────────────────────────────────────────────────────────
@@ -159,7 +153,7 @@ def validate(model, loader, device, max_batches=None, log_wandb_3d=False, log_st
                 step=log_step,
                 prefix="val",
             )
-        total_cd += chamfer_l1(pred, gt).item()
+        total_cd += chamfer_l1_symmetric(pred, gt).item()
         n_batch += 1
     model.train()
     return total_cd / max(n_batch, 1)
@@ -184,30 +178,53 @@ def _run_training(args, wandb_run):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"使用设备：{device}")
 
-    train_ds = CompletionDataset(
-        args.data_root, split='train',
-        input_points=args.input_points, gt_points=args.gt_points,
-    )
-    val_ds = CompletionDataset(
-        args.data_root, split='test',
-        input_points=args.input_points, gt_points=args.gt_points,
-    )
-    log.info(f"训练集：{len(train_ds)} 样本  验证集：{len(val_ds)} 样本")
-    log.info(f"input_points={args.input_points}  gt_points={args.gt_points}")
-    if len(train_ds) >= 100_000:
-        log.info(
-            "数据集规模较大（如 130k 级）：DataLoader 为流式迭代，内存/显存主要由 batch 与模型决定；"
-            "已启用 step 级 mini-val，无需整 epoch 才看到验证指标。"
+    # ── 课程式学习：两个训练集（easy/hard），验证始终使用 hard 的 test 划分 ──
+    # ModelNet: easy=仅 HPR；hard=HPR+块丢弃+噪声（01_preprocess_modelnet40.py）。
+    # PCN: easy=preprocess_pcn_hpr_easy；hard=preprocess_pcn_bbox_pca（partial→bbox+PCA）。
+    data_root_hard = args.data_root_hard or args.data_root
+    data_root_easy = args.data_root_easy or data_root_hard
+    # 当 easy/hard 根目录不同且 epoch_hard_start < epochs 时，才真正发生切换。
+    use_curriculum = (data_root_easy != data_root_hard) and (args.epoch_hard_start >= 1)
+
+    def _make_ds(root, split):
+        if args.use_pcn_rot_aug:
+            return PCNRotAugCompletionDataset(
+                root, split=split,
+                input_points=args.input_points, gt_points=args.gt_points,
+                rot_aug=True, rot_mode=args.pcn_rot_mode,
+            )
+        return CompletionDataset(
+            root, split=split,
+            input_points=args.input_points, gt_points=args.gt_points,
         )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+    train_ds_hard = _make_ds(data_root_hard, 'train')
+    val_ds = _make_ds(data_root_hard, 'test')
+    train_loader_hard = DataLoader(
+        train_ds_hard, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
     )
+
+    if use_curriculum:
+        train_ds_easy = _make_ds(data_root_easy, 'train')
+        train_loader_easy = DataLoader(
+            train_ds_easy, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        )
+        log.info(
+            f"课程式学习启用: easy={data_root_easy} ({len(train_ds_easy)} 样本) "
+            f"-> hard={data_root_hard} ({len(train_ds_hard)} 样本) @ epoch {args.epoch_hard_start}"
+        )
+    else:
+        train_loader_easy = train_loader_hard
+        log.info(f"课程式学习未启用: 始终使用 {data_root_hard} ({len(train_ds_hard)} 样本)")
+
+    log.info(f"验证集 (hard/test): {len(val_ds)} 样本")
+    log.info(f"input_points={args.input_points}  gt_points={args.gt_points}  λ_pres={args.lambda_pres}")
 
     model = SnowflakeNet(up_factors=[1, 4, 8]).to(device)
     load_pretrained(model, args.ckpt_pretrain)
@@ -231,11 +248,27 @@ def _run_training(args, wandb_run):
     sanity_printed = False
 
     for epoch in range(1, args.epochs + 1):
+        # 课程式调度：epoch <= epoch_hard_start 用 easy，其后切 hard。
+        # 默认 epoch_hard_start=50 → 第 1..50 epoch 暖启动于 easy，第 51 epoch 起切 hard。
+        if epoch <= args.epoch_hard_start:
+            current_loader = train_loader_easy
+            stage_tag = "easy"
+        else:
+            current_loader = train_loader_hard
+            stage_tag = "hard"
+            if use_curriculum and epoch == args.epoch_hard_start + 1:
+                log.info(
+                    f"Epoch {epoch}: 启动课程式学习高难度阶段，切换至 Hard DataLoader "
+                    f"({data_root_hard})"
+                )
+
         model.train()
         running_loss = 0.0
+        running_loss_comp = 0.0
+        running_loss_pres = 0.0
         n_steps_in_epoch = 0
 
-        for i, (inp, gt) in enumerate(train_loader):
+        for i, (inp, gt) in enumerate(current_loader):
             inp = inp.to(device, non_blocking=True)
             gt = gt.to(device, non_blocking=True)
 
@@ -256,11 +289,15 @@ def _run_training(args, wandb_run):
                 )
                 sanity_printed = True
 
-            loss = staged_loss(outputs, gt, weights)
+            loss, loss_comp, loss_pres = staged_loss(
+                outputs, gt, inp, weights, lambda_pres=args.lambda_pres,
+            )
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
+            running_loss_comp += loss_comp.item()
+            running_loss_pres += loss_pres.item()
             n_steps_in_epoch += 1
             global_step += 1
 
@@ -268,11 +305,21 @@ def _run_training(args, wandb_run):
             if global_step % args.log_every == 0:
                 lr_now = optimizer.param_groups[0]['lr']
                 log.info(
-                    f"Epoch {epoch:03d} | step {i+1:5d}/{len(train_loader)} "
+                    f"Epoch {epoch:03d} [{stage_tag}] | step {i+1:5d}/{len(current_loader)} "
                     f"| gstep {global_step:7d} | loss {loss.item():.6f} "
+                    f"(comp {loss_comp.item():.6f}, pres {loss_pres.item():.6f}) "
                     f"| lr {lr_now:.2e}"
                 )
                 wandb_utils.log_train_metrics(loss.item(), lr_now, global_step)
+                wandb_utils.log_wandb_scalars(
+                    {
+                        "train/loss_total": loss.item(),
+                        "train/loss_completion": loss_comp.item(),
+                        "train/loss_preservation": loss_pres.item(),
+                        "train/curriculum_stage": 0 if stage_tag == "easy" else 1,
+                    },
+                    global_step,
+                )
 
             # ── step 级 mini-val + 调度 + best/last 保存 ──
             if global_step % args.val_every_steps == 0:
@@ -319,17 +366,22 @@ def _run_training(args, wandb_run):
                     snap,
                 )
 
-        avg = running_loss / max(n_steps_in_epoch, 1)
-        # epoch 末做一次完整 val（不参与 scheduler，仅记录）
+        n = max(n_steps_in_epoch, 1)
+        avg = running_loss / n
+        avg_comp = running_loss_comp / n
+        avg_pres = running_loss_pres / n
         full_val = validate(model, val_loader, device, max_batches=None)
         log.info(
-            f"=== Epoch {epoch:03d}/{args.epochs} done | train_loss_avg {avg:.6f} "
+            f"=== Epoch {epoch:03d}/{args.epochs} [{stage_tag}] done | "
+            f"loss_avg {avg:.6f} (comp {avg_comp:.6f}, pres {avg_pres:.6f}) "
             f"| full_val_cd {full_val:.6f} | best {best_cd:.6f} ==="
         )
         wandb_utils.log_wandb_scalars(
             {
                 "epoch": epoch,
                 "train/epoch_avg_loss": avg,
+                "train/epoch_avg_loss_completion": avg_comp,
+                "train/epoch_avg_loss_preservation": avg_pres,
                 "val/full_chamfer": full_val,
                 "val/best_chamfer": best_cd,
             },
@@ -342,13 +394,15 @@ def _run_training(args, wandb_run):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str,
-                        default='/home/csy/SnowflakeNet_FPFH_ICP/data/processed/modelnet40',
+                        default=os.path.join(project_root, 'data', 'processed', 'PCN_far_in2048_gt16384'),
                         help='processed/<dataset> 路径，下含 train/{input,gt} 与 test/{input,gt}')
     parser.add_argument('--ckpt_pretrain', type=str,
-                        default='/home/csy/SnowflakeNet_FPFH_ICP/Snet/SnowflakeNet-main/'
-                                'completion/checkpoints/ckpt-best-pcn-cd_l1.pth')
+                        default=os.path.join(
+                            project_root, 'Snet', 'SnowflakeNet-main', 'completion',
+                            'checkpoints', 'ckpt-best-pcn-cd_l1.pth',
+                        ))
     parser.add_argument('--save_dir', type=str,
-                        default='/home/csy/SnowflakeNet_FPFH_ICP/checkpoints/snet_finetune')
+                        default=os.path.join(project_root, 'checkpoints', 'snet_finetune'))
 
     # 与原 PCN/SnowflakeNet 一致
     parser.add_argument('--input_points', type=int, default=2048)
@@ -357,7 +411,19 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument(
+        '--lr', type=float, default=1e-5,
+        help='微调建议低于预训练(1e-4)；默认 1e-5 利于保留几何先验',
+    )
+
+    parser.add_argument(
+        '--use-pcn-rot-aug', action='store_true',
+        help='使用 PCN 训练集对 input/GT 同步随机 SO(3) 或仅 yaw 增强（见 --pcn-rot-mode）',
+    )
+    parser.add_argument(
+        '--pcn-rot-mode', type=str, default='so3', choices=('so3', 'yaw'),
+        help='与 PCN 增强一致：全 SO(3) 或仅绕 Z 轴',
+    )
 
     # 各阶段权重 [Pc, P1, P2, P3]
     parser.add_argument('--stage-weights', type=str, default='1.0,1.0,1.0,1.0',
@@ -379,6 +445,31 @@ if __name__ == '__main__':
                         help='周期性快照间隔；<=0 关闭')
     parser.add_argument('--lr-patience', type=int, default=5,
                         help='ReduceLROnPlateau 单位是 mini-val 次数')
+
+    # ── 保真损失 (SnowflakeNet §3.4) ──
+    parser.add_argument(
+        '--lambda-pres', type=float, default=0.05,
+        help='保真损失权重: total = completion + lambda_pres * preservation',
+    )
+
+    # ── 课程式学习 ──
+    parser.add_argument(
+        '--epoch-hard-start', type=int, default=50,
+        help='前 N 个 epoch (epoch <= N) 使用 easy DataLoader 暖启动 SPD 粗->细展开，'
+             '之后 (epoch > N) 切换至 hard。默认 50：第 51 epoch 起启动高难度阶段。',
+    )
+    parser.add_argument(
+        '--data-root-easy', type=str,
+        default=os.path.join(project_root, 'data', 'processed', 'PCN_hpr_easy_in2048_gt16384'),
+        help='课程 easy：ModelNet 用 01_preprocess_modelnet40.py --mode easy；'
+             'PCN 用 preprocess_pcn_hpr_easy.py 产出目录。',
+    )
+    parser.add_argument(
+        '--data-root-hard', type=str,
+        default=os.path.join(project_root, 'data', 'processed', 'PCN_far_in2048_gt16384'),
+        help='课程 hard / 验证集：ModelNet 用 01 --mode hard；'
+             'PCN 用 preprocess_pcn_bbox_pca。验证始终用本目录下 test。',
+    )
 
     args = parser.parse_args()
     main(args)

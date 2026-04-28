@@ -1,0 +1,19 @@
+[project]
+name = "snowflakenet-fpfh-icp"
+version = "0.1.0"
+description = "PCN completion + pose (SnowflakeNet, FPFH/ICP)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch",
+  "tqdm",
+  "open3d",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
