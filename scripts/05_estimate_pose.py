@@ -64,9 +64,10 @@ def _invert_row_transform(t: np.ndarray) -> np.ndarray:
     return out
 
 
-def _resample_2048(points: np.ndarray, seed: int = 0) -> np.ndarray:
-    return prep.resample_rng(
-        np.asarray(points, dtype=np.float32), 2048, np.random.default_rng(int(seed))
+def _resample_2048(points: np.ndarray, seed: int = 0, mode: str = "fps") -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    return prep.resample_fixed_n(
+        np.asarray(points, dtype=np.float32), 2048, rng, mode=mode
     )
 
 
@@ -84,6 +85,7 @@ def run_one(
     fpfh_voxel: float,
     gate_fitness: float,
     *,
+    input_resample_mode: str = "fps",
     do_comp_filter: bool = False,
     filter_cfg: FilterConfig | None = None,
     do_reg_filter: bool = True,
@@ -115,7 +117,7 @@ def run_one(
     ).reshape(1, 3)
     scale_cano = float(meta.get("scale_cano", 1.0))
     p_input_cano = ((p_rough - centroid_cano) / np.float32(scale_cano)).astype(np.float32)
-    p_in = _resample_2048(p_input_cano, seed=0)
+    p_in = _resample_2048(p_input_cano, seed=0, mode=input_resample_mode)
 
     p_pred_cano = complete_points(model, p_in)
     if do_comp_filter:
@@ -203,6 +205,12 @@ def main() -> None:
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--fpfh-voxel", type=float, default=0.03)
     parser.add_argument("--gate-fitness", type=float, default=0.5)
+    parser.add_argument(
+        "--input-resample",
+        default="fps",
+        choices=("fps", "random"),
+        help="送入 SNet 前将 canonical 观测重采样到 2048 点的策略（与预处理一致可复现对齐）",
+    )
     parser.add_argument("--no-reg-filter", action="store_true")
     parser.add_argument("--legacy-comp-filter", action="store_true", help="补全后归一化域 SOR+gate")
     parser.add_argument("--gate-mul", type=float, default=3.0)
@@ -235,6 +243,7 @@ def main() -> None:
         model=model, completed_dir=args.completed_dir, icp_dist=args.icp_dist,
         icp_mode=args.icp_mode, icp_iter=args.icp_iter, vis=args.vis,
         fpfh_voxel=args.fpfh_voxel, gate_fitness=args.gate_fitness,
+        input_resample_mode=args.input_resample,
         do_comp_filter=args.legacy_comp_filter, do_reg_filter=not args.no_reg_filter,
         reg_filter_cfg=rcfg,
     )

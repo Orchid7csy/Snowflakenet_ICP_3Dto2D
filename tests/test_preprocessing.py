@@ -83,3 +83,14 @@ def test_random_gravity_axis_rot_zero_is_identity():
     rng = np.random.default_rng(5)
     R = p.random_gravity_axis_rot(rng, 0.0, axis="z")
     assert np.allclose(R, np.eye(3), atol=1e-6)
+
+def test_resample_fixed_n_shape_fps_random():
+    rng = np.random.default_rng(0)
+    pts = rng.standard_normal((500, 3)).astype(np.float32)
+    a = p.resample_fixed_n(pts, 2048, rng, mode="fps")
+    b = p.resample_fixed_n(pts, 2048, rng, mode="random")
+    assert a.shape == (2048, 3) and b.shape == (2048, 3)
+    few = pts[:100]
+    c = p.resample_fixed_n(few, 2048, rng, mode="fps")
+    assert c.shape == (2048, 3)
+

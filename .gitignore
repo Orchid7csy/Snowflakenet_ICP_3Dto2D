@@ -11,6 +11,8 @@
 !scripts/**
 !tests/
 !tests/**
+!experiment/
+!experiment/**
 !README.md
 !pyproject.toml
 !pytest.ini

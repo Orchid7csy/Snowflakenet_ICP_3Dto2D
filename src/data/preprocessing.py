@@ -170,6 +170,48 @@ def resample_rng(points: np.ndarray, n: int, rng: np.random.Generator) -> np.nda
     return points[idx].astype(np.float32)
 
 
+def farthest_point_sample_numpy(points: np.ndarray, npoint: int, *, rng: np.random.Generator) -> np.ndarray:
+    """FPS downsample (N,3) -> (npoint,3)，与 Snet completion/utils 经典实现一致。"""
+    n = int(points.shape[0])
+    if n <= 0:
+        return np.zeros((npoint, 3), dtype=np.float32)
+    if npoint >= n:
+        return points.astype(np.float32)
+    xyz = np.asarray(points[:, :3], dtype=np.float64)
+    centroids = np.zeros((npoint,), dtype=np.int64)
+    distance = np.ones((n,), dtype=np.float64) * 1e10
+    farthest = int(rng.integers(0, n))
+    for i in range(int(npoint)):
+        centroids[i] = farthest
+        centroid = xyz[farthest, :]
+        dist = np.sum((xyz - centroid) ** 2, axis=-1)
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        farthest = int(np.argmax(distance))
+    return points[centroids.astype(np.int32)].astype(np.float32)
+
+
+def resample_fixed_n(
+    points: np.ndarray,
+    n: int,
+    rng: np.random.Generator,
+    *,
+    mode: str = "fps",
+) -> np.ndarray:
+    """固定输出 ``n`` 点：不足则放回随机重复；达到或超过 ``n`` 时用 FPS 或无放回随机下采样。
+
+    ``mode``: ``"fps"``（默认）或 ``"random"``。
+    """
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.shape[0] == 0:
+        return np.zeros((n, 3), dtype=np.float32)
+    if pts.shape[0] >= n:
+        if mode.lower() == "fps":
+            return farthest_point_sample_numpy(pts, n, rng=rng)
+        return resample_rng(pts, n, rng)
+    return resample_rng(pts, n, rng)
+
+
 def apply_inverse_normalization(p_comp: np.ndarray, meta: dict) -> np.ndarray:
     """补全点云从 canonical input 空间逆变换到 obs_w 世界系。
 

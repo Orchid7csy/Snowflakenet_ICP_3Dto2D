@@ -90,6 +90,7 @@ def _process_one_with_gt(
     t_max: float,
     rot_aug_deg: float,
     rot_aug_axis: str,
+    input_resample: str,
 ) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, dict]:
     stem = sample_stem(split=split, synset=synset, model_id=model_id, view=view_idx)
     rng = np.random.default_rng(
@@ -107,9 +108,9 @@ def _process_one_with_gt(
     r_far, t_far, t_norm = prep.sample_random_far_transform(rng, t_min, t_max)
     obs_w = prep.apply_rigid_row(part_obj, r_far, t_far)
 
-    p_rs = prep.resample_rng(part_cano, num_input, rng)
+    p_rs = prep.resample_fixed_n(part_cano, num_input, rng, mode=input_resample)
     g_rs = prep.resample_rng(gt_cano, num_gt, rng)
-    obs_rs = prep.resample_rng(obs_w, num_input, rng)
+    obs_rs = prep.resample_fixed_n(obs_w, num_input, rng, mode=input_resample)
     t_far_4x4 = prep.rigid_T_4x4(r_far, t_far)
     meta = {
         "C_cano": c_cano,
@@ -186,6 +187,7 @@ def _run_one_model(
     t_max: float,
     rot_aug_deg: float,
     rot_aug_axis: str,
+    input_resample: str,
     skip_existing: bool,
     no_meta: bool,
 ) -> tuple[int, int, int, list[str]]:
@@ -266,6 +268,7 @@ def _run_one_model(
                 t_max=t_max,
                 rot_aug_deg=rot_aug_deg,
                 rot_aug_axis=rot_aug_axis,
+                input_resample=input_resample,
             )
         except Exception as e:
             n_fail += 1
@@ -312,6 +315,7 @@ def _mp_worker_model(
         t_max=float(cfg["t_max"]),
         rot_aug_deg=float(cfg["rot_aug_deg"]),
         rot_aug_axis=str(cfg["rot_aug_axis"]),
+        input_resample=str(cfg["input_resample"]),
         skip_existing=bool(cfg["skip_existing"]),
         no_meta=bool(cfg["no_meta"]),
     )
@@ -326,8 +330,8 @@ def main() -> int:
         "--out-root",
         type=str,
         default="",
-        help="默认 hard: data/processed/PCN_far_cano_in{input}_gt{gt}/；"
-             "easy: data/processed/PCN_hpr_easy_cano_in{input}_gt{gt}/",
+        help="默认: data/processed/PCN_far8_cano_in{input}_gt{gt}/；"
+             "课程 easy 可用单独目录（如 PCN_hpr_easy_*）",
     )
     ap.add_argument("--splits", type=str, default="train,val,test")
     ap.add_argument("--num-input", type=int, default=2048)
@@ -350,7 +354,13 @@ def main() -> int:
         choices=("x", "y", "z"),
         help="--rot-aug-deg 对应的重力轴",
     )
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--input-resample",
+        type=str,
+        default="fps",
+        choices=("fps", "random"),
+        help="canonical input 与 obs_w 固定点数时的策略：FPS（默认）或无放回随机；不足 n 时仍用放回随机补齐",
+    )
     ap.add_argument("--t-min", type=float, default=1.0, help="t_far 模长下界")
     ap.add_argument("--t-max", type=float, default=3.0, help="t_far 模长上界")
     ap.add_argument("--skip-existing", action="store_true")
@@ -419,6 +429,7 @@ def main() -> int:
                 t_max=args.t_max,
                 rot_aug_deg=float(args.rot_aug_deg),
                 rot_aug_axis=str(args.rot_aug_axis),
+                input_resample=str(args.input_resample),
                 skip_existing=bool(args.skip_existing),
                 no_meta=bool(args.no_meta),
             )
@@ -437,6 +448,7 @@ def main() -> int:
             "t_max": float(args.t_max),
             "rot_aug_deg": float(args.rot_aug_deg),
             "rot_aug_axis": str(args.rot_aug_axis),
+            "input_resample": str(args.input_resample),
             "skip_existing": bool(args.skip_existing),
             "no_meta": bool(args.no_meta),
         }
@@ -472,7 +484,8 @@ def main() -> int:
             f"pairs_before_selection={n_pairs_before_selection}\n"
         )
         f.write(
-            f"schema=cano rot_aug_deg={args.rot_aug_deg} rot_aug_axis={args.rot_aug_axis}\n"
+            f"schema=cano rot_aug_deg={args.rot_aug_deg} rot_aug_axis={args.rot_aug_axis} "
+            f"input_resample={args.input_resample}\n"
         )
         f.write(
             f"workers={n_workers} omp_threads_per_worker={omp_tw} cpu_count={cpu_n} "

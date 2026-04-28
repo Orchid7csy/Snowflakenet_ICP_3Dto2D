@@ -233,8 +233,8 @@ def _run_training(args, wandb_run):
 
     # ── 课程式学习：两个训练集（easy/hard），验证始终使用 hard 的 test 划分 ──
     # ModelNet: easy=仅 HPR；hard=HPR+块丢弃+噪声（legacy 预处理）。
-    # PCN: 00_preprocess_pcn.py --mode easy 产出每模型 HPR 最佳视角 easy 集；
-    # --mode hard/默认产出所有 PCN partial 视角 hard 集。无单独 easy 目录时回退到 hard。
+    # PCN easy: 可用较小子集或单独预处理目录；hard: `00_preprocess_pcn.py` 固定 8 视角。
+    # 无单独 easy 目录时回退到 hard。
     data_root_hard = args.data_root_hard or args.data_root
     data_root_easy = args.data_root_easy or data_root_hard
     if not os.path.isdir(_train_input_dir(data_root_easy)):
@@ -524,7 +524,7 @@ def _run_training(args, wandb_run):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str,
-                        default=os.path.join(project_root, 'data', 'processed', 'PCN_far_cano_in2048_gt16384'),
+                        default=os.path.join(project_root, 'data', 'processed', 'PCN_far8_cano_in2048_gt16384'),
                         help='processed/<dataset> 路径，下含 train/{input,gt} 与 test/{input,gt}')
     parser.add_argument('--ckpt_pretrain', type=str,
                         default=os.path.join(
@@ -613,9 +613,8 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--data-root-hard', type=str,
-        default=os.path.join(project_root, 'data', 'processed', 'PCN_far_cano_in2048_gt16384'),
-        help='课程 hard / 验证集：ModelNet 用 01 --mode hard；'
-             'PCN 用 preprocess_pcn_bbox_pca。验证始终用本目录下 test。',
+        default=os.path.join(project_root, 'data', 'processed', 'PCN_far8_cano_in2048_gt16384'),
+        help='课程 hard / 验证集：PCN 用 `00_preprocess_pcn.py` 产出目录；验证始终用本目录下 test。',
     )
 
     args = parser.parse_args()
