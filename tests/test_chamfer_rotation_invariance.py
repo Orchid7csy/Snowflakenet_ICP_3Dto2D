@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 import torch
 
-from snet_pcn_chamfer import chamfer_l1_symmetric
-from pcn_completion_dataset import sample_rotation_matrix
+from src.data.pcn_dataset import sample_rotation_matrix
+from src.models.chamfer import chamfer_l1_symmetric
 
 
 def _assert_r_orthonormal_so3(r: np.ndarray) -> None:
