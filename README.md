@@ -220,4 +220,5 @@ data/processed/PCN_far8_cano_in2048_gt16384/{train,val,test}/{input,gt,obs_w,met
 | pytest 收集失败 | `export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`（见 `tests/conftest.py`） |
 | Cursor / 终端卡死、反复 skip 后仍极慢 | ① 全局 pytest 插件（如 ROS）：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。② 仅在 `tests/` 跑测试（`pytest.ini` 已 `testpaths=tests`）。③ 勿在仓库根堆放上千 `.npy`；`/debug/`、`/results/` 已忽略。④ Chamfer/CD 相关测试需要 PyTorch；环境缺 torch 会在收集阶段报错（并非无限 skip） |
 | 疑惑「src 未被追踪」 | `.gitignore` 已为**黑名单**：默认跟踪 `src/`、`scripts/`、`tests/`、`experiment/` 源码；仅忽略数据集目录与大文件后缀。用 `git ls-files src` 核对 |
-| `wandb`: API key must be 40 characters, yours was 86 | 新版密钥 `wandb_v1_*` 需 **`pip install -U 'wandb>=0.22.3'`**；或 **`python scripts/02_train_completion.py --no-wandb`** 关闭云端日志 |
+| `wandb`：`wandb_v1_*` 密钥 / 「API key must be 40 characters」 | **新版本密钥需要 wandb>=0.22.3 → Python≥3.8**。若在 Python 3.7 环境无法安装：`conda env create -f environment_wandb_online.yml` 新建 **Python≥3.10** 环境后再装 wandb；或 **`python scripts/02_train_completion.py --no-wandb`** |
+| `scripts/`/`src/` 部分文件无法 `git add` 或推送后被忽略 | 多为「无前导 `/`」的目录规则误匹配子路径；现已收紧（`/PCN/`、`/wandb/` 等仅根目录）。自查：`git check-ignore -v -- <路径>`；确认为源码则核对文件名勿用大后缀匹配规则（如 `*.npz`） |

@@ -1,6 +1,6 @@
-# ── 策略：默认跟踪源码；仅忽略大包、数据集、权重与生成物（不再使用「先 * 再白名单」以免漏跟目录）──
+# ── 黑名单：默认跟踪全部源码；下列规则勿写成无前导 / 的目录名，否则会误伤 scripts/** 或 src/** 下同名片段 ──
 
-# Python / 构建
+# Python / 构建产物（全局）
 __pycache__/
 *.py[cod]
 *$py.class
@@ -10,8 +10,32 @@ __pycache__/
 *.egg-info/
 .eggs/
 pip-wheel-metadata/
-dist/
-build/
+
+# 仅仓库根的构建产物目录
+/build/
+/dist/
+
+# 本地 IDE（任意层级；避免误提交 src/.vscode 等）
+.vscode/
+.idea/
+
+# 第三方与大目录（通常仅在仓库根克隆）
+/Snet/
+/PCN/
+/data/
+/checkpoints/
+/test_demo/
+/wandb/
+
+# 仓库根目录临时导出（大块张量）
+/input/
+/gt/
+/meta/
+/obs_w/
+
+# 本地调试输出（仅根目录）
+/debug/
+/results/
 
 # 虚拟环境
 .venv/
@@ -25,25 +49,7 @@ env/
 .coverage
 htmlcov/
 
-# IDE（本地配置不需要入库）
-.vscode/
-.idea/
-
-# 第三方代码与臃肿数据（不入库）
-Snet/
-PCN/
-/data/
-checkpoints/
-test_demo/
-wandb/
-
-# 仓库根目录常见临时导出（大块张量/点云）
-/input/
-/gt/
-/meta/
-/obs_w/
-
-# 点云、网格、张量、权重（全局匹配；请勿把源码命名为此类扩展名）
+# 点云、网格、张量、权重（全局后缀：请勿将源码命名为 .pcd/.npy 等）
 *.npy
 *.npz
 *.pcd
@@ -67,7 +73,7 @@ wandb/
 *.7z
 *.rar
 
-# 日志与本地数据库
+# 日志与本地数据库（全局后缀）
 *.log
 *.db
 *.db-wal
@@ -75,7 +81,3 @@ wandb/
 # 操作系统
 .DS_Store
 Thumbs.db
-
-# 本地调试与跑实验产出（不入库）
-/debug/
-/results/
