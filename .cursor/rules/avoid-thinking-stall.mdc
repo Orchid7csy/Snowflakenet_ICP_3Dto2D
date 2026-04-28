@@ -1,0 +1,25 @@
+---
+description: When Composer stalls on Thinking / Skipped or slow diffs in this repo
+globs:
+alwaysApply: false
+---
+
+# 减轻 Thinking / Skipped / Diff 缓慢（本仓库）
+
+- **缩小上下文**：只附带 `src/`、`scripts/`、`tests/`、`experiment/` 内明确路径；不要附带 `PCN/`、`data/`、`*.npy`、`Snet/`。
+- **避免巨型 diff**：改单一脚本时优先说明「整文件重写」需求，减少与海量历史 hunks 对齐。
+- **数据文件**：`.cursorignore` 已排除多数二进制；若仍卡，在对话里写明「忽略工作区内所有除附件外的文件」。
+
+## 可复制 Prompt（按需粘贴）
+
+**1. 强制重写、少做 diff 对齐**  
+`Ignore all current context analysis. DO NOT try to diff with existing code. JUST REWRITE the entire core logic of [FILENAME] according to the latest requirements. Minimize text explanation, just output the full code block.`
+
+**2. 锁死视野（防扫海量数据）**  
+`Strictly focus on the files attached to this chat. IGNORE the rest of the workspace and all binary/data files. Re-initialize your reasoning only based on the provided code logic.`
+
+**3. 跳出逻辑循环 / Skipped**  
+`Reset your internal state for this task. You are currently stuck in a logic loop. Let's start fresh: Apply P_pred_w = (P_pred_cano * scale + centroid) composed with T_coarse per scripts/05_estimate_pose.py row-vector convention. No more skipping.`
+
+**4. 自检（仍卡时）**  
+`Diagnostic Run: You are taking too long to think/skip. Is it because of large data files in context, or complex diff calculation? If so, stop what you are doing, acknowledge the issue, and provide a stripped-down version of the code in plain text format instead of the composer diff.`

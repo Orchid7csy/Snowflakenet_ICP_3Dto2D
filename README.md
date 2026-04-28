@@ -2,7 +2,8 @@
 
 本仓库实现 **基于生成式几何先验的位姿收敛域扩张**：在极端残缺条件下，将 SnowflakeNet（SNet）点云补全作为 **几何代理（Geometric Proxy）**，在 ICP 原生吸引域外构造更接近完整的观测，引导优化轨迹进入收敛半径；**最终位姿精度仍由原始观测与 CAD 的 ICP 锁定**，补全网络不作为毫米级精度来源。
 
-**一站式核查脚本与自检工具**位于 **`experiment/convergence_basin/`**（详见该目录下 `README.md`）。
+**一站式核查脚本与自检工具**位于 **`experiment/convergence_basin/`**（详见该目录下 `README.md`）。  
+**Composer / Thinking / Skipped 卡顿**：可复制提示词见 **`experiment/convergence_basin/CURSOR_THINKING_SKIP.md`**，规则摘要见 **`.cursor/rules/avoid-thinking-stall.mdc`**（`.cursorignore` 已排除缓存与 `data/processed/` 等以降低索引量）。
 
 ---
 
@@ -216,3 +217,6 @@ data/processed/PCN_far8_cano_in2048_gt16384/{train,val,test}/{input,gt,obs_w,met
 | Gate 始终拒绝 | 检查补全质量、`--gate-fitness`、`--fpfh-voxel`、以及反归一化是否与 meta 一致 |
 | 微调 CD 不降 | 学习率组、是否加载预训练、`verify_processed_dataset` 是否全通过 |
 | Cursor 里看不到 `src/data/` | `.cursorignore` 曾用 `data/` 会误匹配 `src/data/`；已改为仓库根的 `/data/`。若仍异常，以 `git ls-files src/data` 为准 |
+| pytest 收集失败 | `export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`（见 `tests/conftest.py`） |
+| Cursor / 终端卡死、反复 skip 后仍极慢 | ① 全局 pytest 插件（如 ROS）：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。② 仅在 `tests/` 跑测试（`pytest.ini` 已 `testpaths=tests`）。③ 勿在仓库根堆放上千 `.npy`；`/debug/`、`/results/` 已忽略。④ Chamfer/CD 相关测试需要 PyTorch；环境缺 torch 会在收集阶段报错（并非无限 skip） |
+| 疑惑「src 未被追踪」 | `.gitignore` 已为**黑名单**：默认跟踪 `src/`、`scripts/`、`tests/`、`experiment/` 源码；仅忽略数据集目录与大文件后缀。用 `git ls-files src` 核对 |

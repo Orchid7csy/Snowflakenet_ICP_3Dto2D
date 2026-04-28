@@ -1,66 +1,81 @@
-# 默认忽略所有内容（白名单式版本控制：只跟踪核心代码）
-*
+# ── 策略：默认跟踪源码；仅忽略大包、数据集、权重与生成物（不再使用「先 * 再白名单」以免漏跟目录）──
 
-# 允许版本控制本文件
-!.gitignore
-
-# 仅放行核心代码目录
-!src/
-!src/**
-!scripts/
-!scripts/**
-!tests/
-!tests/**
-!experiment/
-!experiment/**
-!.cursorignore
-!.cursorignore
-!README.md
-!pyproject.toml
-!pytest.ini
-
-# 常见：Python 生成文件（即便在 src/scripts 内也应忽略）
-**/__pycache__/
-**/*.py[cod]
-**/*.so
-**/*.pyd
-**/*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+# Python / 构建
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+dist/
+build/
 
 # 虚拟环境
 .venv/
 venv/
 env/
 
-# IDE
-.vscode/
+# 测试与类型检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# 明确忽略：第三方/大文件/数据/权重/压缩包/点云
+# IDE（本地配置不需要入库）
+.vscode/
+.idea/
+
+# 第三方代码与臃肿数据（不入库）
 Snet/
+PCN/
 /data/
 checkpoints/
 test_demo/
+wandb/
 
-*.pth
-*.pt
-*.ckpt
-*.onnx
-*.npz
+# 仓库根目录常见临时导出（大块张量/点云）
+/input/
+/gt/
+/meta/
+/obs_w/
+
+# 点云、网格、张量、权重（全局匹配；请勿把源码命名为此类扩展名）
 *.npy
+*.npz
 *.pcd
 *.ply
 *.obj
 *.stl
 *.off
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
 
+# 压缩包与归档
 *.zip
 *.tar
 *.tar.gz
 *.tgz
+*.tbz2
 *.7z
 *.rar
 
+# 日志与本地数据库
+*.log
+*.db
+*.db-wal
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 本地调试与跑实验产出（不入库）
+/debug/
+/results/

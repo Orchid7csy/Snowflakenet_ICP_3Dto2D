@@ -5,12 +5,29 @@
 *.ply
 *.obj
 
-# Cursor indexing
+# 大块数据集与第三方（降低 Cursor 索引 / Lexical 卡顿）
+Snet/
+wandb/
+PCN/
+
+# 预处理产物与临时导出（根目录）
+/input/
+/gt/
+/meta/
+/obs_w/
+data/processed/
+
+# Python / 测试缓存（海量小文件会拖慢「Thinking」与 watcher）
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+**/.pytest_cache/
+
+# 日志与本地数据库
 checkpoints/**/*.log
 checkpoints/**/*.pth
 *.log
 *.db-wal
-
-Snet/
-wandb/
-PCN/
+*.db

@@ -1,0 +1,2 @@
+# 保证 Linux / Git Bash 下可执行，避免 /usr/bin/env: "bash\r"
+*.sh text eol=lf
