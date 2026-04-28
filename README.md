@@ -27,6 +27,30 @@
 
 ---
 
+## AutoDL / spd（Python 3.7）：必须使用 **在线 W&B** 时
+
+新密钥 **`wandb_v1_*`** 需要 **`wandb>=0.22.3`**，而该版本要求 **Python≥3.8**；**无法在 spd（Python 3.7）内安装**，因此会出现日志里的 ERROR——不是密钥错误，而是**解释器版本不满足**。
+
+**可行做法**：另建 **Python 3.10** 环境专门训练（与 spd 并存即可）：
+
+```bash
+conda env create -f environment_wandb_online.yml
+conda activate snowflake-wandb
+cd ~/autodl-tmp/Snowflakenet_ICP_3Dto2D
+
+# PyTorch：按 AutoDL 实例的 CUDA 版本从 https://pytorch.org 生成命令（示例 CUDA 11.8）
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+pip install -r requirements-train-online.txt
+export WANDB_API_KEY="wandb_v1_你的完整密钥"
+bash scripts/run_train_py310.sh
+```
+
+- **不要**在 `conda activate spd` 下跑上述训练；在线 W&B 必须在 **Python≥3.8** 的解释器里启动。
+- `PYTHONPATH` 已由 `run_train_py310.sh` 设置（含 `Snet/`）。
+
+---
+
 ## 完整实验流程（顺序与穿插验证）
 
 按下表顺序执行。**验证列**为建议在完成该步骤后立即运行的检查；**预期效果**为判断实验是否「在轨道上」的经验阈值（非替代论文原始指标）。

@@ -1,0 +1,9 @@
+# 训练 + W&B 在线（wandb_v1 API key 需要 wandb>=0.22.3 → Python>=3.8）
+# 在 spd(Python3.7) 中无法满足；请另建环境后：
+#   pip install -r requirements-train-online.txt
+#（PyTorch 请按 AutoDL 显卡/CUDA 单独安装，见 README「AutoDL 在线 W&B」一节）
+
+wandb>=0.22.3
+numpy
+tqdm
+open3d

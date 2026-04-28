@@ -1,13 +1,6 @@
-# 独立环境：在 AutoDL / 旧 Python 3.7 的 spd 里无法安装 wandb>=0.22（新 wandb_v1 API key）。
-# 使用本文件创建 Python>=3.10 环境后再训练即可在线同步 W&B：
-#
-#   conda env create -f environment_wandb_online.yml
-#   conda activate snowflake-wandb
-#   cd ~/autodl-tmp/Snowflakenet_ICP_3Dto2D
-#   pip install -e .   # 或按 README 安装 torch/open3d/tqdm/numpy
-#   pip install -U "wandb>=0.22.3"
-#   export WANDB_API_KEY="wandb_v1_..."
-#   python scripts/02_train_completion.py
+# 仅创建 Python 3.10 + pip；其余依赖请：
+#   pip install torch ...（按 CUDA）
+#   pip install -r requirements-train-online.txt
 #
 name: snowflake-wandb
 channels:
