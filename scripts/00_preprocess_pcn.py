@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import zlib
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
@@ -102,13 +103,15 @@ def _filter_pairs_by_best_hpr(
     ]
 
 
-def _process_one(
+def _process_one_with_gt(
     split: str,
     synset: str,
     model_id: str,
     partial_pcd: Path,
     complete_pcd: Path,
     view_idx: int,
+    part_obj: np.ndarray,
+    gt_obj: np.ndarray,
     *,
     num_input: int,
     num_gt: int,
@@ -122,9 +125,6 @@ def _process_one(
     rng = np.random.default_rng(
         (base_seed + zlib.adler32(stem.encode("utf-8"))) % (2**32)
     )
-
-    part_obj = read_pcd_xyz(partial_pcd)
-    gt_obj = read_pcd_xyz(complete_pcd)
 
     part_cano, gt_cano, c_cano, scale_cano = prep.normalize_by_complete(gt_obj, part_obj)
 
@@ -203,8 +203,9 @@ def _pool_init_threads(omp_threads: int) -> None:
     _limit_blas_omp_threads(max(1, int(omp_threads)))
 
 
-def _run_one_pair(
-    item: tuple[str, str, str, Path, Path, int],
+def _run_one_model(
+    model_key: tuple[str, str, str],
+    candidates: list[tuple[Path, Path, int]],
     out_root: Path,
     *,
     num_input: int,
@@ -216,10 +217,15 @@ def _run_one_pair(
     rot_aug_axis: str,
     skip_existing: bool,
     no_meta: bool,
-) -> tuple[str, str]:
-    """处理单条样本：必要时计算并落盘。返回 (status, message)，status ∈ ok|skip|fail。"""
-    split, synset, model_id, pp, gp, view_idx = item
-    stem = sample_stem(split=split, synset=synset, model_id=model_id, view=view_idx)
+) -> tuple[int, int, int, list[str]]:
+    """处理同一 model 下的所有候选 partial：仅读 complete 一次。
+
+    返回 (n_ok, n_skip, n_fail, fail_msgs)。
+    """
+    if not candidates:
+        return (0, 0, 0, [])
+    split, synset, model_id = model_key
+    fail_msgs: list[str] = []
 
     idir = out_root / split / "input"
     gdir = out_root / split / "gt"
@@ -230,67 +236,103 @@ def _run_one_pair(
     if not no_meta:
         mdir.mkdir(parents=True, exist_ok=True)
 
-    ip = idir / f"{stem}.npy"
-    gpout = gdir / f"{stem}.npy"
-    op = odir / f"{stem}.npy"
-    mp = mdir / f"{stem}.npz"
-
-    if skip_existing and ip.is_file() and gpout.is_file() and op.is_file():
-        return ("skip", "")
-
-    try:
-        _stem, pin, gto, obw, meta = _process_one(
-            split,
-            synset,
-            model_id,
-            pp,
-            gp,
-            view_idx,
-            num_input=num_input,
-            num_gt=num_gt,
-            base_seed=base_seed,
-            t_min=t_min,
-            t_max=t_max,
-            rot_aug_deg=rot_aug_deg,
-            rot_aug_axis=rot_aug_axis,
+    todo: list[tuple[Path, Path, int, str, Path, Path, Path, Path]] = []
+    n_skip = 0
+    for pp, gp, view_idx in candidates:
+        stem = sample_stem(
+            split=split, synset=synset, model_id=model_id, view=view_idx
         )
-    except Exception as e:
-        return ("fail", f"{pp}: {e}")
-    if _stem != stem:
-        return ("fail", f"internal stem mismatch: {_stem!r} vs {stem!r}")
+        ip = idir / f"{stem}.npy"
+        gpout = gdir / f"{stem}.npy"
+        op = odir / f"{stem}.npy"
+        mp = mdir / f"{stem}.npz"
+        if skip_existing and ip.is_file() and gpout.is_file() and op.is_file():
+            n_skip += 1
+            continue
+        todo.append((pp, gp, int(view_idx), stem, ip, gpout, op, mp))
+
+    if not todo:
+        return (0, n_skip, 0, fail_msgs)
+
+    complete_pcd = todo[0][1]
+    complete_resolved = complete_pcd.resolve()
+    for pp, gp, *_ in todo:
+        if gp.resolve() != complete_resolved:
+            fail_msgs.append(
+                f"{split}/{synset}/{model_id}: complete 路径不一致: {gp} vs {complete_pcd}"
+            )
+            return (0, n_skip, len(todo), fail_msgs)
 
     try:
-        np.save(str(ip), pin.astype(np.float32))
-        np.save(str(gpout), gto.astype(np.float32))
-        np.save(str(op), obw.astype(np.float32))
-        if not no_meta:
-            np.savez(str(mp), **meta)
+        gt_obj = read_pcd_xyz(complete_pcd)
     except Exception as e:
-        return ("fail", f"save {stem}: {e}")
-    return ("ok", "")
+        fail_msgs.append(f"{complete_pcd}: {e}")
+        return (0, n_skip, len(todo), fail_msgs)
+
+    n_ok = 0
+    n_fail = 0
+    for pp, gp, view_idx, stem, ip, gpout, op, mp in todo:
+        try:
+            part_obj = read_pcd_xyz(pp)
+        except Exception as e:
+            n_fail += 1
+            fail_msgs.append(f"{pp}: {e}")
+            continue
+        try:
+            _stem, pin, gto, obw, meta = _process_one_with_gt(
+                split,
+                synset,
+                model_id,
+                pp,
+                gp,
+                view_idx,
+                part_obj,
+                gt_obj,
+                num_input=num_input,
+                num_gt=num_gt,
+                base_seed=base_seed,
+                t_min=t_min,
+                t_max=t_max,
+                rot_aug_deg=rot_aug_deg,
+                rot_aug_axis=rot_aug_axis,
+            )
+        except Exception as e:
+            n_fail += 1
+            fail_msgs.append(f"{pp}: {e}")
+            continue
+        if _stem != stem:
+            n_fail += 1
+            fail_msgs.append(f"internal stem mismatch: {_stem!r} vs {stem!r}")
+            continue
+        try:
+            np.save(str(ip), pin.astype(np.float32))
+            np.save(str(gpout), gto.astype(np.float32))
+            np.save(str(op), obw.astype(np.float32))
+            if not no_meta:
+                np.savez(str(mp), **meta)
+            n_ok += 1
+        except Exception as e:
+            n_fail += 1
+            fail_msgs.append(f"save {stem}: {e}")
+    return (n_ok, n_skip, n_fail, fail_msgs)
 
 
-def _mp_item_to_tuple(
-    item: tuple[str, str, str, Path, Path, int],
-) -> tuple[str, str, str, str, str, int]:
-    split, synset, model_id, pp, gp, view_idx = item
-    return (split, synset, model_id, str(pp), str(gp), view_idx)
+def _mp_pack_model(
+    key: tuple[str, str, str],
+    cands: list[tuple[Path, Path, int]],
+) -> tuple[tuple[str, str, str], list[tuple[str, str, int]]]:
+    return (key, [(str(pp), str(gp), int(vi)) for pp, gp, vi in cands])
 
 
-def _mp_worker(
-    packed: tuple[str, str, str, str, str, int],
+def _mp_worker_model(
+    packed: tuple[tuple[str, str, str], list[tuple[str, str, int]]],
     cfg: dict[str, object],
-) -> tuple[str, str]:
-    item = (
-        packed[0],
-        packed[1],
-        packed[2],
-        Path(packed[3]),
-        Path(packed[4]),
-        int(packed[5]),
-    )
-    return _run_one_pair(
-        item,
+) -> tuple[int, int, int, list[str]]:
+    key, cand_s = packed
+    candidates = [(Path(a), Path(b), int(c)) for a, b, c in cand_s]
+    return _run_one_model(
+        key,
+        candidates,
         Path(str(cfg["out_root"])),
         num_input=int(cfg["num_input"]),
         num_gt=int(cfg["num_gt"]),
@@ -414,6 +456,12 @@ def main() -> int:
         print("无 (partial, complete) 对", file=sys.stderr)
         return 1
 
+    by_model: dict[tuple[str, str, str], list[tuple[Path, Path, int]]] = defaultdict(list)
+    for split, synset, model_id, pp, gp, vi in pairs:
+        by_model[(split, synset, model_id)].append((pp, gp, vi))
+    model_keys = sorted(by_model.keys())
+    n_models = len(model_keys)
+
     cpu_n = os.cpu_count() or 1
     if int(args.workers) <= 0:
         n_workers = max(1, min(cpu_n, 48))
@@ -428,9 +476,10 @@ def main() -> int:
         else "pcn cano+T_far"
     )
     if n_workers == 1:
-        for item in tqdm(pairs, desc=desc):
-            status, msg = _run_one_pair(
-                item,
+        for key in tqdm(model_keys, desc=desc):
+            ok, sk, fa, fmsgs = _run_one_model(
+                key,
+                by_model[key],
                 out_root,
                 num_input=args.num_input,
                 num_gt=args.num_gt,
@@ -442,14 +491,11 @@ def main() -> int:
                 skip_existing=bool(args.skip_existing),
                 no_meta=bool(args.no_meta),
             )
-            if status == "ok":
-                n_ok += 1
-            elif status == "skip":
-                n_skip += 1
-            else:
-                n_fail += 1
-                if msg:
-                    print(f"\n[fail] {msg}", file=sys.stderr)
+            n_ok += ok
+            n_skip += sk
+            n_fail += fa
+            for m in fmsgs:
+                print(f"\n[fail] {m}", file=sys.stderr)
     else:
         cfg_dict: dict[str, object] = {
             "out_root": str(out_root),
@@ -463,9 +509,8 @@ def main() -> int:
             "skip_existing": bool(args.skip_existing),
             "no_meta": bool(args.no_meta),
         }
-        mp_items = [_mp_item_to_tuple(it) for it in pairs]
-        n_task = len(mp_items)
-        worker_fn = partial(_mp_worker, cfg=cfg_dict)
+        mp_items = [_mp_pack_model(k, by_model[k]) for k in model_keys]
+        worker_fn = partial(_mp_worker_model, cfg=cfg_dict)
         with ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_pool_init_threads,
@@ -474,18 +519,15 @@ def main() -> int:
             futures = [ex.submit(worker_fn, it) for it in mp_items]
             for fut in tqdm(
                 as_completed(futures),
-                total=n_task,
+                total=n_models,
                 desc=f"{desc} [{n_workers}w]",
             ):
-                status, msg = fut.result()
-                if status == "ok":
-                    n_ok += 1
-                elif status == "skip":
-                    n_skip += 1
-                else:
-                    n_fail += 1
-                    if msg:
-                        print(f"\n[fail] {msg}", file=sys.stderr)
+                ok, sk, fa, fmsgs = fut.result()
+                n_ok += ok
+                n_skip += sk
+                n_fail += fa
+                for m in fmsgs:
+                    print(f"\n[fail] {m}", file=sys.stderr)
 
     manifest = out_root / "00_preprocess_pcn_manifest.txt"
     with open(manifest, "w", encoding="utf-8") as f:
@@ -503,7 +545,8 @@ def main() -> int:
             f"schema=cano rot_aug_deg={args.rot_aug_deg} rot_aug_axis={args.rot_aug_axis}\n"
         )
         f.write(
-            f"workers={n_workers} omp_threads_per_worker={omp_tw} cpu_count={cpu_n}\n"
+            f"workers={n_workers} omp_threads_per_worker={omp_tw} cpu_count={cpu_n} "
+            f"n_models={n_models}\n"
         )
     print(f"完成: 写入 {n_ok}, 跳过 {n_skip}, 失败 {n_fail} / {len(pairs)}. 输出: {out_root}\n摘要: {manifest}")
     return 0 if n_fail == 0 else 2

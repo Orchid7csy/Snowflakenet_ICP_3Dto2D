@@ -3,7 +3,7 @@ PCN 最优 HPR 视角：对每个 (split, synset, model_id) 选 partial，使 PC
 
 用法:
   python scripts/01_compute_best_view.py --pcn-root PCN --splits test --out-json data/processed/PCN_hpr_best_views.json
-  python scripts/01_compute_best_view.py --pcn-root PCN --splits train,val,test --workers 32
+  python scripts/01_compute_best_view.py --pcn-root PCN --splits train,val,test --workers 8 --timing-stats
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
@@ -73,16 +74,15 @@ def _iter_pairs(
     return out
 
 
-def _score_partial(
+def _score_partial_from_gt(
     partial_pcd: Path,
-    complete_pcd: Path,
+    gt_obj: np.ndarray,
     *,
     num_views: int,
     hpr_sphere_r: float,
     hpr_r_eff: float,
 ) -> tuple[int, int]:
     part = _read_pcd_xyz(partial_pcd)
-    gt_obj = _read_pcd_xyz(complete_pcd)
     _part_cano, gt_cano, _c, _s = _prep.normalize_by_complete(gt_obj, part)
     return max_hpr_visibility_count(
         gt_cano,
@@ -145,15 +145,32 @@ def _best_view_for_model(
     hpr_sphere_r: float,
     hpr_r_eff: float,
 ) -> dict | None:
+    if not candidates:
+        return None
+    complete_pcd = candidates[0][1]
+    cr = complete_pcd.resolve()
+    for _pp, gp, _vi in candidates:
+        if gp.resolve() != cr:
+            raise ValueError(
+                f"同一模型下 complete 路径不一致: {gp} vs {complete_pcd} "
+                f"({split}/{synset}/{model_id})"
+            )
+
+    try:
+        gt_obj = _read_pcd_xyz(complete_pcd)
+    except Exception as e:
+        print(f"\n[warn] complete {complete_pcd}: {e}", file=sys.stderr)
+        return None
+
     best_pp: Path | None = None
     best_vi = 10**9
     best_n = -1
     best_dir = 0
-    for partial_pcd, complete_pcd, view_idx in candidates:
+    for partial_pcd, _complete_pcd, view_idx in candidates:
         try:
-            n_vis, dir_i = _score_partial(
+            n_vis, dir_i = _score_partial_from_gt(
                 partial_pcd,
-                complete_pcd,
+                gt_obj,
                 num_views=num_views,
                 hpr_sphere_r=hpr_sphere_r,
                 hpr_r_eff=hpr_r_eff,
@@ -197,11 +214,12 @@ def _mp_pack_candidates(
 def _mp_worker_model(
     packed: tuple[tuple[str, str, str], list[tuple[str, str, int]]],
     cfg: dict[str, object],
-) -> tuple[str, dict | None]:
+) -> tuple[str, dict | None, float]:
     key, cand_s = packed
     split, synset, model_id = key
     pcn_root = Path(str(cfg["pcn_root"]))
     candidates = [(Path(a), Path(b), int(c)) for a, b, c in cand_s]
+    t0 = time.perf_counter()
     entry = _best_view_for_model(
         split,
         synset,
@@ -212,8 +230,9 @@ def _mp_worker_model(
         hpr_sphere_r=float(cfg["hpr_sphere_r"]),
         hpr_r_eff=float(cfg["hpr_r_eff"]),
     )
+    dt = time.perf_counter() - t0
     jk = f"{split}__{synset}__{model_id}"
-    return (jk, entry)
+    return (jk, entry, dt)
 
 
 def main() -> int:
@@ -250,6 +269,11 @@ def main() -> int:
         default=1,
         help="每个子进程内 OpenMP/BLAS 等线程上限；多进程时建议保持为 1",
     )
+    ap.add_argument(
+        "--timing-stats",
+        action="store_true",
+        help="结束后打印每模型任务耗时的分位数（秒），用于回归与瓶颈诊断",
+    )
     args = ap.parse_args()
     _sanitize_invalid_thread_env()
 
@@ -283,10 +307,12 @@ def main() -> int:
         n_workers = max(1, int(args.workers))
     omp_tw = max(1, int(args.omp_threads_per_worker))
 
+    task_seconds: list[float] = []
     out_by_model: dict[str, dict] = {}
     if n_workers == 1:
         for key in tqdm(keys_sorted, desc="pcn best hpr view"):
             split, synset, model_id = key
+            t0 = time.perf_counter()
             entry = _best_view_for_model(
                 split,
                 synset,
@@ -297,6 +323,8 @@ def main() -> int:
                 hpr_sphere_r=args.hpr_sphere_r,
                 hpr_r_eff=hpr_r_eff,
             )
+            if args.timing_stats:
+                task_seconds.append(time.perf_counter() - t0)
             if entry is None:
                 continue
             jk = f"{split}__{synset}__{model_id}"
@@ -324,9 +352,20 @@ def main() -> int:
                 total=n_task,
                 desc=f"pcn best hpr view [{n_workers}w]",
             ):
-                jk, entry = fut.result()
+                jk, entry, dt = fut.result()
+                if args.timing_stats:
+                    task_seconds.append(dt)
                 if entry is not None:
                     out_by_model[jk] = entry
+
+    timing_payload: dict[str, float] = {}
+    if task_seconds:
+        arr = np.asarray(task_seconds, dtype=np.float64)
+        qs = (0, 25, 50, 75, 90, 95, 99, 100)
+        timing_payload = {f"pct_{q}": float(np.percentile(arr, q)) for q in qs}
+        timing_payload["mean"] = float(arr.mean())
+        timing_payload["std"] = float(arr.std())
+        timing_payload["n_tasks_timed"] = int(arr.size)
 
     payload = {
         "version": 1,
@@ -342,6 +381,8 @@ def main() -> int:
             "workers": n_workers,
             "omp_threads_per_worker": omp_tw,
             "cpu_count": cpu_n,
+            "timing_stats": bool(args.timing_stats),
+            **({"per_task_seconds_summary": timing_payload} if timing_payload else {}),
         },
         "by_model": out_by_model,
     }
@@ -353,6 +394,8 @@ def main() -> int:
         f.write("\n")
 
     print(f"写入 {len(out_by_model)} 条 -> {out_path}")
+    if timing_payload:
+        print("每模型耗时统计 (秒):", json.dumps(timing_payload, ensure_ascii=False))
     return 0
 
 
