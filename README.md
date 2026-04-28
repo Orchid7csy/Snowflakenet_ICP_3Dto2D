@@ -27,27 +27,39 @@
 
 ---
 
-## AutoDL / spd（Python 3.7）：必须使用 **在线 W&B** 时
+## AutoDL / spd（Python 3.7）与 **在线 W&B**
 
-新密钥 **`wandb_v1_*`** 需要 **`wandb>=0.22.3`**，而该版本要求 **Python≥3.8**；**无法在 spd（Python 3.7）内安装**，因此会出现日志里的 ERROR——不是密钥错误，而是**解释器版本不满足**。
+SnowflakeNet 官方仓库常用 **`conda create -n spd python=3.7`** + **Torch 1.7.x**，与本微调脚本兼容。**云端日志限制来自 wandb 客户端，而非 PyTorch 版本**：新版密钥 **`wandb_v1_*`** 必须使用 **`wandb>=0.22.3`**，而该 wheel **不支持 Python 3.7**。因此在 **spd 内无法用 wandb_v1 密钥「原地在线」**——除非你改用下列其一。
 
-**可行做法**：另建 **Python 3.10** 环境专门训练（与 spd 并存即可）：
+### 方案 A — **留在 spd（Python 3.7）**又要云端上传（与官方编译栈一致）
+
+1. 在 **https://wandb.ai → User Settings → API keys** 查看是否仍可创建或使用 **Legacy API key（40 个字符的十六进制串）**。  
+   - **仅有 `wandb_v1_*`、无法用 Legacy**：请看下方方案 B。
+2. 安装 **支持 py37 的旧 wandb**（不要用 `pip install -U wandb` 拉到 0.19+）：
+
+```bash
+conda activate spd
+pip install -r requirements-wandb-legacy-py37.txt
+export WANDB_API_KEY="此处粘贴40字符Legacy密钥"
+python scripts/02_train_completion.py
+```
+
+### 方案 B — 必须用 **`wandb_v1_*`** 新密钥在线
+
+必须在 **Python≥3.8**（推荐 3.10）中安装 **`wandb>=0.22.3`**，与 spd **并存两个 conda 环境**即可（SnowflakeNet 仍在 `Snet/`，无需重编译）：
 
 ```bash
 conda env create -f environment_wandb_online.yml
 conda activate snowflake-wandb
 cd ~/autodl-tmp/Snowflakenet_ICP_3Dto2D
-
-# PyTorch：按 AutoDL 实例的 CUDA 版本从 https://pytorch.org 生成命令（示例 CUDA 11.8）
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118   # 按 GPU 改
 pip install -r requirements-train-online.txt
-export WANDB_API_KEY="wandb_v1_你的完整密钥"
+export WANDB_API_KEY="wandb_v1_你的密钥"
 bash scripts/run_train_py310.sh
 ```
 
-- **不要**在 `conda activate spd` 下跑上述训练；在线 W&B 必须在 **Python≥3.8** 的解释器里启动。
-- `PYTHONPATH` 已由 `run_train_py310.sh` 设置（含 `Snet/`）。
+- **不要**在 `conda activate spd` 下执行方案 B。
+- `run_train_py310.sh` 已设置 `PYTHONPATH`（含 `Snet/`）。
 
 ---
 
@@ -244,5 +256,5 @@ data/processed/PCN_far8_cano_in2048_gt16384/{train,val,test}/{input,gt,obs_w,met
 | pytest 收集失败 | `export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`（见 `tests/conftest.py`） |
 | Cursor / 终端卡死、反复 skip 后仍极慢 | ① 全局 pytest 插件（如 ROS）：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。② 仅在 `tests/` 跑测试（`pytest.ini` 已 `testpaths=tests`）。③ 勿在仓库根堆放上千 `.npy`；`/debug/`、`/results/` 已忽略。④ Chamfer/CD 相关测试需要 PyTorch；环境缺 torch 会在收集阶段报错（并非无限 skip） |
 | 疑惑「src 未被追踪」 | `.gitignore` 已为**黑名单**：默认跟踪 `src/`、`scripts/`、`tests/`、`experiment/` 源码；仅忽略数据集目录与大文件后缀。用 `git ls-files src` 核对 |
-| `wandb`：`wandb_v1_*` 密钥 / 「API key must be 40 characters」 | **新版本密钥需要 wandb>=0.22.3 → Python≥3.8**。若在 Python 3.7 环境无法安装：`conda env create -f environment_wandb_online.yml` 新建 **Python≥3.10** 环境后再装 wandb；或 **`python scripts/02_train_completion.py --no-wandb`** |
+| `wandb`：`wandb_v1_*` / 「API key must be 40 characters」 | **spd(py37)**：新密钥需 **`wandb>=0.22.3`**（仅 py≥3.8）。要么 **`requirements-wandb-legacy-py37.txt` + Legacy 40 字符密钥**，要么 **`environment_wandb_online.yml` + requirements-train-online.txt`（py≥3.10）**；或 **`--no-wandb`** |
 | `scripts/`/`src/` 部分文件无法 `git add` 或推送后被忽略 | 多为「无前导 `/`」的目录规则误匹配子路径；现已收紧（`/PCN/`、`/wandb/` 等仅根目录）。自查：`git check-ignore -v -- <路径>`；确认为源码则核对文件名勿用大后缀匹配规则（如 `*.npz`） |

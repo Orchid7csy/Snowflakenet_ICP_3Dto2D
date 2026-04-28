@@ -1,0 +1,5 @@
+# 仅适用于 Python 3.7（SnowflakeNet 官方环境 spd）：
+# - wandb 0.19+ 要求 Python>=3.8，故钉在 0.18.x
+# - 该组合只接受 W&B「旧版」40 字符十六进制 API key，不接受 wandb_v1_* 新密钥
+#   （若控制台只提供新密钥，请改用 README「方案 B」单独 Python>=3.10 环境，或 --no-wandb）
+wandb>=0.15.10,<0.19

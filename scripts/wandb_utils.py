@@ -62,9 +62,11 @@ def init_wandb(
     if key.startswith("wandb_v1_"):
         if sys.version_info < (3, 8):
             log.error(
-                "WANDB_API_KEY is wandb_v1 format but Python %s cannot install wandb>=0.22.3. "
-                "Options: (1) conda env Python>=3.10: see environment_wandb_online.yml "
-                "(2) train with --no-wandb.",
+                "WANDB_API_KEY is wandb_v1 format but Python %s cannot install wandb>=0.22.3.\n"
+                "  • Stay on Python 3.7 + SnowflakeNet official stack: use a **legacy 40-char** "
+                "API key + `pip install -r requirements-wandb-legacy-py37.txt` (see README).\n"
+                "  • Or use conda Python>=3.10: environment_wandb_online.yml + requirements-train-online.txt.\n"
+                "  • Or: python scripts/02_train_completion.py --no-wandb",
                 sys.version.split()[0],
             )
             return None
