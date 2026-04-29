@@ -16,7 +16,7 @@
 
   python scripts/05_estimate_pose.py --eval-all --split test \\
       --data-root data/processed/PCN_far8_cano_in2048_gt16384 \\
-      --ckpt checkpoints/snet_finetune/ckpt-best.pth
+      --ckpt checkpoints/ckpt-best.pth
 """
 from __future__ import annotations
 
@@ -318,7 +318,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--ckpt",
-        default=os.path.join(_PROJECT_ROOT, "checkpoints", "snet_finetune", "ckpt-best.pth"),
+        default=os.path.join(_PROJECT_ROOT, "checkpoints", "ckpt-best.pth"),
     )
     parser.add_argument("--completed-dir", default=os.path.join(_PROJECT_ROOT, "data", "completed"))
     parser.add_argument("--icp-dist", type=float, default=0.03)
@@ -391,6 +391,11 @@ def main() -> None:
             raise FileNotFoundError(args.ckpt)
 
         print(f"eval-all: split={args.split}  stems={len(stems)}  ckpt={args.ckpt}")
+        try:
+            o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
+        except Exception:
+            pass
+
         model = load_snowflakenet(args.ckpt)
 
         rows: List[Dict[str, object]] = []
