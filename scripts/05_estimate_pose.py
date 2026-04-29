@@ -85,6 +85,13 @@ def _resample_2048(points: np.ndarray, seed: int = 0, mode: str = "fps") -> np.n
     )
 
 
+def _rotation_angle_deg_from_transform(t: np.ndarray) -> float:
+    r = np.asarray(t, dtype=np.float64)[:3, :3]
+    cos_theta = (np.trace(r) - 1.0) * 0.5
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
 def run_one(
     stem: str,
     input_path: str,
@@ -98,6 +105,10 @@ def run_one(
     vis: bool,
     fpfh_voxel: float,
     gate_fitness: float,
+    max_iter: int,
+    convergence_eps_rot: float,
+    convergence_eps_trans: float,
+    iterative_refine: bool,
     *,
     input_resample_mode: str = "fps",
     do_comp_filter: bool = False,
@@ -137,52 +148,104 @@ def run_one(
     baseline_fitness = float(reg_baseline.fitness)
     baseline_inlier_rmse = float(reg_baseline.inlier_rmse)
 
-    # 2) obs_w 摆正到粗物体系，再 canonical 归一化，并固定 2048 点
-    t_coarse_inv = _invert_row_transform(t_coarse)
-    p_rough = _apply_row_transform(p_obs_w, t_coarse_inv)
-    centroid_cano = np.asarray(
-        meta.get("centroid_cano", meta.get("C_cano")), dtype=np.float32
-    ).reshape(1, 3)
-    scale_cano = float(meta.get("scale_cano", 1.0))
-    p_input_cano = ((p_rough - centroid_cano) / np.float32(scale_cano)).astype(np.float32)
-    p_in = _resample_2048(p_input_cano, seed=0, mode=input_resample_mode)
-
-    p_pred_cano = complete_points(model, p_in)
-    if do_comp_filter:
-        cfg = filter_cfg or FilterConfig()
-        p_pred_cano, _ = filter_completion_spurious(p_pred_cano, p_in, cfg=cfg)
-
+    p_pred_cano = None
+    p_in_vis = None
+    gate_ok = False
+    last_gate_fitness = 0.0
+    gate_status = "TIMEOUT"
+    iter_count = 1
+    t_gate = t_coarse.copy()
     completed_dir = _ensure_dir(completed_dir)
     os.makedirs(completed_dir, exist_ok=True)
     comp_path = os.path.join(completed_dir, f"{stem}_completed.npy")
-    np.save(comp_path, p_pred_cano.astype(np.float32))
-
-    # 3) 严格反归一化: P_pred_w = (P_pred_cano * S + C) * T_coarse
-    p_pred_obj = (p_pred_cano * np.float32(scale_cano) + centroid_cano).astype(np.float32)
-    p_pred_w = _apply_row_transform(p_pred_obj, t_coarse)
-
-    filtered_comp = p_pred_w
-    if do_reg_filter:
-        rcfg = reg_filter_cfg or RegistrationFilterConfig()
-        filtered_comp, _ = filter_registration_aware(
-            p_pred_w, p_obs_w, cfg=rcfg
+    if iterative_refine:
+        T_current = t_coarse.copy()
+        for iter_idx in range(int(max_iter)):
+            t_current_inv = _invert_row_transform(T_current)
+            p_rough_iter = _apply_row_transform(p_obs_w, t_current_inv)
+            p_input_cano_iter, norm_meta_iter = prep.normalize_by_complete(p_rough_iter, p_cad)
+            scale_k = np.float32(norm_meta_iter["scale"])
+            centroid_k = np.asarray(norm_meta_iter["centroid"], dtype=np.float32).reshape(1, 3)
+            p_in_iter = _resample_2048(p_input_cano_iter, seed=iter_idx, mode=input_resample_mode)
+            p_in_vis = p_in_iter
+            pred_cano_iter = complete_points(model, p_in_iter)
+            if do_comp_filter:
+                cfg = filter_cfg or FilterConfig()
+                pred_cano_iter, _ = filter_completion_spurious(pred_cano_iter, p_in_iter, cfg=cfg)
+            pred_w_iter = (pred_cano_iter * scale_k + centroid_k).astype(np.float32)
+            pred_w_iter = _apply_row_transform(pred_w_iter, T_current)
+            if do_reg_filter:
+                rcfg = reg_filter_cfg or RegistrationFilterConfig()
+                pred_w_iter, _ = filter_registration_aware(pred_w_iter, p_obs_w, cfg=rcfg)
+            reg_gate_iter = icp_refine(
+                source=to_o3d_pcd(p_cad, color=(0.2, 0.8, 1.0)),
+                target=to_o3d_pcd(pred_w_iter, color=(1.0, 0.6, 0.1)),
+                init_transform=T_current,
+                max_correspondence_distance=icp_dist, mode=icp_mode, max_iteration=icp_iter,
+            )
+            t_next = np.asarray(reg_gate_iter.transformation, dtype=np.float64)
+            d_t = t_next @ _invert_row_transform(T_current)
+            rot_deg = _rotation_angle_deg_from_transform(d_t)
+            trans_norm = float(np.linalg.norm(d_t[:3, 3]))
+            converged = rot_deg < float(convergence_eps_rot) and trans_norm < float(convergence_eps_trans)
+            gate_ok = float(reg_gate_iter.fitness) >= float(gate_fitness)
+            last_gate_fitness = float(reg_gate_iter.fitness)
+            print(
+                f"[Iter {iter_idx}] fitness={float(reg_gate_iter.fitness):.3f}  "
+                f"rmse={float(reg_gate_iter.inlier_rmse):.3f}  gate={'OK' if gate_ok else 'FAIL'}  "
+                f"converged={converged}"
+            )
+            p_pred_cano = pred_cano_iter
+            t_gate = t_next
+            iter_count = iter_idx + 1
+            if gate_ok:
+                gate_status = "OK"
+                T_for_final_icp = t_next  # [from Gate-ICP iter]
+                break
+            if converged:
+                gate_status = "CONVERGED"
+                T_for_final_icp = t_next  # [from last iter, gate timeout]
+                break
+            T_current = t_next
+        else:
+            gate_status = "TIMEOUT"
+            T_for_final_icp = T_current  # [from last iter, gate timeout]
+    else:
+        # 原单次 Gate-ICP（保留）
+        t_coarse_inv = _invert_row_transform(t_coarse)
+        p_rough = _apply_row_transform(p_obs_w, t_coarse_inv)
+        p_input_cano, norm_meta = prep.normalize_by_complete(p_rough, p_cad)
+        scale_cano = np.float32(norm_meta["scale"])
+        centroid_cano = np.asarray(norm_meta["centroid"], dtype=np.float32).reshape(1, 3)
+        p_in = _resample_2048(p_input_cano, seed=0, mode=input_resample_mode)
+        p_in_vis = p_in
+        p_pred_cano = complete_points(model, p_in)
+        if do_comp_filter:
+            cfg = filter_cfg or FilterConfig()
+            p_pred_cano, _ = filter_completion_spurious(p_pred_cano, p_in, cfg=cfg)
+        p_pred_obj = (p_pred_cano * scale_cano + centroid_cano).astype(np.float32)
+        p_pred_w = _apply_row_transform(p_pred_obj, t_coarse)
+        if do_reg_filter:
+            rcfg = reg_filter_cfg or RegistrationFilterConfig()
+            p_pred_w, _ = filter_registration_aware(p_pred_w, p_obs_w, cfg=rcfg)
+        reg_gate = icp_refine(
+            source=to_o3d_pcd(p_cad, color=(0.2, 0.8, 1.0)),
+            target=to_o3d_pcd(p_pred_w, color=(1.0, 0.6, 0.1)),
+            init_transform=t_coarse,
+            max_correspondence_distance=icp_dist, mode=icp_mode, max_iteration=icp_iter,
         )
-
-    # 4) Gate-ICP（CAD -> P_pred_w），失败回退 T_coarse
-    src_gate = to_o3d_pcd(p_cad, color=(0.2, 0.8, 1.0))
-    tgt_gate = to_o3d_pcd(filtered_comp, color=(1.0, 0.6, 0.1))
-    reg_gate = icp_refine(
-        source=src_gate, target=tgt_gate, init_transform=t_coarse,
-        max_correspondence_distance=icp_dist, mode=icp_mode, max_iteration=icp_iter,
-    )
-    gate_ok = float(reg_gate.fitness) >= float(gate_fitness)
-    t_init = np.asarray(reg_gate.transformation if gate_ok else t_coarse, dtype=np.float64)
+        gate_ok = float(reg_gate.fitness) >= float(gate_fitness)
+        last_gate_fitness = float(reg_gate.fitness)
+        t_gate = np.asarray(reg_gate.transformation, dtype=np.float64)
+        gate_status = "OK" if gate_ok else "TIMEOUT"
+        T_for_final_icp = t_gate if gate_ok else t_coarse  # [from Gate-ICP iter]
+    np.save(comp_path, np.asarray(p_pred_cano, dtype=np.float32))
 
     # 5) 最终 ICP（CAD -> obs_w）
     src = to_o3d_pcd(p_cad, color=(0.2, 0.8, 1.0))
     tgt = to_o3d_pcd(p_obs_w, color=(1.0, 0.0, 0.0))
     reg = icp_refine(
-        source=src, target=tgt, init_transform=t_init,
+        source=src, target=tgt, init_transform=T_for_final_icp,
         max_correspondence_distance=icp_dist, mode=icp_mode, max_iteration=icp_iter,
     )
     t = np.asarray(reg.transformation, dtype=np.float64)
@@ -194,7 +257,7 @@ def run_one(
             window_name="World space: obs_w(red) vs CAD@T_final(green)",
             width=1280, height=720,
         )
-        cano_obs = to_o3d_pcd(p_in, color=(1.0, 0.0, 0.0))
+        cano_obs = to_o3d_pcd(p_in_vis, color=(1.0, 0.0, 0.0))
         cano_pred = to_o3d_pcd(p_pred_cano, color=(0.25, 0.85, 0.35))
         o3d.visualization.draw_geometries(
             [cano_obs, cano_pred],
@@ -214,10 +277,12 @@ def run_one(
         "icp_fitness": ours_fit,
         "icp_inlier_rmse": ours_rmse,
         "T_coarse": t_coarse,
-        "T_gate": np.asarray(reg_gate.transformation, dtype=np.float64),
-        "gate_fitness": float(reg_gate.fitness),
+        "T_gate": np.asarray(t_gate, dtype=np.float64),
+        "gate_fitness": float(last_gate_fitness),
         "gate_threshold": float(gate_fitness),
         "gate_accepted": bool(gate_ok),
+        "iter_count": int(iter_count),
+        "final_gate": gate_status,
         "T_icp": t,
         "T_far_4x4": t_far,
         "meta_path": meta_path,
@@ -260,7 +325,7 @@ def print_batch_summary(rows: List[Dict[str, object]]) -> None:
     )
     hdr = (
         f"{'Class':<12} {'n':>6} "
-        f"{'Base_Fit':>13} {'Ours_Fit':>13} {'Base_RMSE':>13} {'Ours_RMSE':>13} {'Gate_OK%':>9}"
+        f"{'Base_Fit':>13} {'Ours_Fit':>13} {'Base_RMSE':>13} {'Ours_RMSE':>13} {'Gate_OK%':>9} {'AvgIter':>8}"
     )
     print(hdr)
     print("-" * w)
@@ -270,37 +335,38 @@ def print_batch_summary(rows: List[Dict[str, object]]) -> None:
     class_mean_br: List[float] = []
     class_mean_or: List[float] = []
 
-    def _agg(rs: List[Dict[str, object]]) -> tuple[float, float, float, float, float]:
+    def _agg(rs: List[Dict[str, object]]) -> tuple[float, float, float, float, float, float]:
         nloc = len(rs)
         bf = float(np.mean([float(x["baseline_fitness"]) for x in rs]))
         of = float(np.mean([float(x["ours_fitness"]) for x in rs]))
         br = float(np.mean([float(x["baseline_inlier_rmse"]) for x in rs]))
         ort = float(np.mean([float(x["ours_inlier_rmse"]) for x in rs]))
         gk = 100.0 * float(np.mean([1.0 if bool(x["gate_accepted"]) else 0.0 for x in rs]))
-        return bf, of, br, ort, gk
+        ai = float(np.mean([float(x.get("iter_count", 1)) for x in rs]))
+        return bf, of, br, ort, gk, ai
 
     for _syn, cname in TAXONOMY_TABLE1:
         rs = by_class.get(cname, [])
         if not rs:
             print(
                 f"{cname:<12} {0:6d} "
-                f"{'--':>13} {'--':>13} {'--':>13} {'--':>13} {'--':>9}"
+                f"{'--':>13} {'--':>13} {'--':>13} {'--':>13} {'--':>9} {'--':>8}"
             )
             continue
         n = len(rs)
-        bf, of, br, ort, gk = _agg(rs)
+        bf, of, br, ort, gk, ai = _agg(rs)
         class_mean_bf.append(bf)
         class_mean_of.append(of)
         class_mean_br.append(br)
         class_mean_or.append(ort)
-        print(f"{cname:<12} {n:6d} {bf:13.6f} {of:13.6f} {br:13.6f} {ort:13.6f} {gk:8.1f}%")
+        print(f"{cname:<12} {n:6d} {bf:13.6f} {of:13.6f} {br:13.6f} {ort:13.6f} {gk:8.1f}% {ai:8.3f}")
 
     unk = [k for k in by_class if k not in {t[1] for t in TAXONOMY_TABLE1}]
     for u in sorted(unk):
         rs = by_class[u]
         n = len(rs)
-        bf, of, br, ort, gk = _agg(rs)
-        print(f"{u:<12} {n:6d} {bf:13.6f} {of:13.6f} {br:13.6f} {ort:13.6f} {gk:8.1f}%")
+        bf, of, br, ort, gk, ai = _agg(rs)
+        print(f"{u:<12} {n:6d} {bf:13.6f} {of:13.6f} {br:13.6f} {ort:13.6f} {gk:8.1f}% {ai:8.3f}")
 
     print("-" * w)
     macro_bf = float(np.mean(class_mean_bf)) if class_mean_bf else float("nan")
@@ -315,15 +381,16 @@ def print_batch_summary(rows: List[Dict[str, object]]) -> None:
     micro_g = 100.0 * float(
         np.mean([1.0 if bool(r["gate_accepted"]) else 0.0 for r in rows])
     )
+    micro_ai = float(np.mean([float(r.get("iter_count", 1)) for r in rows]))
     n_all = len(rows)
 
     print(
         f"{'MacroAvg':<12} {'—':>6} {macro_bf:13.6f} {macro_of:13.6f} {macro_br:13.6f} {macro_or:13.6f} "
-        f"{'—':>9}  (#cls={len(class_mean_bf)})"
+        f"{'—':>9} {'—':>8}  (#cls={len(class_mean_bf)})"
     )
     print(
         f"{'MicroAvg':<12} {n_all:6d} {micro_bf:13.6f} {micro_of:13.6f} {micro_br:13.6f} {micro_or:13.6f} "
-        f"{micro_g:8.1f}%"
+        f"{micro_g:8.1f}% {micro_ai:8.3f}"
     )
     print("=" * w + "\n")
 
@@ -369,7 +436,11 @@ def main() -> None:
     parser.add_argument("--icp-iter", type=int, default=50)
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--fpfh-voxel", type=float, default=0.03)
-    parser.add_argument("--gate-fitness", type=float, default=0.5)
+    parser.add_argument("--gate-fitness", "--gate_fitness", dest="gate_fitness", type=float, default=0.3)
+    parser.add_argument("--max-iter", "--max_iter", dest="max_iter", type=int, default=3)
+    parser.add_argument("--convergence-eps-rot", "--convergence_eps_rot", dest="convergence_eps_rot", type=float, default=1.0)
+    parser.add_argument("--convergence-eps-trans", "--convergence_eps_trans", dest="convergence_eps_trans", type=float, default=0.001)
+    parser.add_argument("--iterative-refine", action="store_true", help="启用迭代精炼 Gate-ICP")
     parser.add_argument(
         "--input-resample",
         default="fps",
@@ -463,6 +534,10 @@ def main() -> None:
                     vis=False,
                     fpfh_voxel=args.fpfh_voxel,
                     gate_fitness=args.gate_fitness,
+                    max_iter=args.max_iter,
+                    convergence_eps_rot=args.convergence_eps_rot,
+                    convergence_eps_trans=args.convergence_eps_trans,
+                    iterative_refine=args.iterative_refine,
                     input_resample_mode=args.input_resample,
                     do_comp_filter=args.legacy_comp_filter,
                     do_reg_filter=not args.no_reg_filter,
@@ -482,6 +557,7 @@ def main() -> None:
                 "ours_inlier_rmse": out["ours_inlier_rmse"],
                 "gate_accepted": out["gate_accepted"],
                 "gate_fitness": out["gate_fitness"],
+                "iter_count": out["iter_count"],
             })
 
         print(f"\n完成: success={len(rows)}  skip={n_skip}")
@@ -519,6 +595,10 @@ def main() -> None:
         vis=args.vis,
         fpfh_voxel=args.fpfh_voxel,
         gate_fitness=args.gate_fitness,
+        max_iter=args.max_iter,
+        convergence_eps_rot=args.convergence_eps_rot,
+        convergence_eps_trans=args.convergence_eps_trans,
+        iterative_refine=args.iterative_refine,
         input_resample_mode=args.input_resample,
         do_comp_filter=args.legacy_comp_filter,
         do_reg_filter=not args.no_reg_filter,
@@ -541,6 +621,7 @@ def main() -> None:
         f"gate: fitness={out['gate_fitness']:.6f} "
         f"threshold={out['gate_threshold']:.3f} accepted={out['gate_accepted']}"
     )
+    print(f"iter_count={out['iter_count']} final_gate={out['final_gate']}")
     print("T_icp (4x4, CAD -> obs_w, final ICP):")
     np.set_printoptions(precision=6, suppress=True)
     print(out["T_icp"])
