@@ -152,11 +152,44 @@ def _viz_four_columns(
     )
 
 
+_CLOUD_EPILOG = """
+云端（AutoDL，项目在项目根 ~/autodl-tmp/project）示例::
+
+  cd ~/autodl-tmp/project   # 或你的仓库根目录，须含 Snet/、src/
+
+  # 必须指定预处理目录（含 train|test/input 与 gt）；无显示器时自动写出 ply
+  PYTHONPATH=. python scripts/04_viz_completion_processed_compare.py \\
+      --processed-root data/processed/PCN_far8_cano_in2048_gt16384 \\
+      --split test --sample-index 0
+
+  # 指定导出目录（可选）
+  PYTHONPATH=. python scripts/04_viz_completion_processed_compare.py \\
+      --processed-root data/processed/PCN_far8_cano_in2048_gt16384 \\
+      --split test --sample-index 0 --max-stems 3 \\
+      --save-dir ~/autodl-tmp/project/completion_compare_export
+
+  # 绝对路径亦可
+  PYTHONPATH=. python scripts/04_viz_completion_processed_compare.py \\
+      --processed-root /root/autodl-tmp/project/data/processed/PCN_far8_cano_in2048_gt16384 \\
+      --split test --sample-index 0
+
+权重默认：官方 ``Snet/.../ckpt-best-pcn-cd_l1.pth``，微调 ``checkpoints/ckpt-best.pth``
+（可用 ``--official-ckpt`` / ``--ours-ckpt`` 覆盖）。
+"""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="预处理数据上 official vs finetune 补全对比（与 03_eval 同一前向）。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_CLOUD_EPILOG,
     )
-    ap.add_argument("--processed-root", required=True)
+    ap.add_argument(
+        "--processed-root",
+        required=True,
+        metavar="DIR",
+        help="预处理根目录：须含 {split}/input/*.npy 与 gt/*.npy（与 03_eval 一致）。例：data/processed/PCN_far8_cano_in2048_gt16384",
+    )
     ap.add_argument("--split", default="test", choices=("train", "val", "test"))
     ap.add_argument("--official-ckpt", default=_DEFAULT_OFFICIAL_CKPT)
     ap.add_argument("--ours-ckpt", default=_DEFAULT_OURS_CKPT)
