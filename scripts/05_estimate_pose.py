@@ -352,8 +352,12 @@ def main() -> None:
 
     if args.list_stems:
         print(f"# {args.split}: {len(stems_all)} stems (have input + obs_w + meta)")
-        for st in stems_all:
-            print(st)
+        try:
+            for st in stems_all:
+                print(st)
+        except BrokenPipeError:
+            # ``... | head`` 会在读完行数后关闭管道，随后 write 触发该异常（退出码 0 即可）
+            pass
         return
 
     rcfg = RegistrationFilterConfig(
