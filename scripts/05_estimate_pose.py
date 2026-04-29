@@ -41,11 +41,13 @@ from collections import defaultdict
 from typing import DefaultDict, Dict, List
 
 import numpy as np
+import pandas as pd
 import open3d as o3d
 import torch
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
+_RESULTS_DIR = os.path.join(_PROJECT_ROOT, "results")
 _SNET_ROOT = os.path.join(_PROJECT_ROOT, "Snet", "SnowflakeNet-main")
 for _p in (_PROJECT_ROOT, _SNET_ROOT, _SCRIPT_DIR):
     if _p not in sys.path:
@@ -356,6 +358,149 @@ def discover_valid_stems(data_root: str, split: str) -> List[str]:
     return stems
 
 
+def _pose_eval_row_to_detail(row: Dict[str, object]) -> Dict[str, float | bool | str | int]:
+    """Per-sample CSV row matching ``results/pose_sample_details.csv`` schema."""
+    stem = str(row["stem"])
+    cname = str(row["class"])
+    hist = list(row.get("iter_history") or [])
+    f1 = f2 = f3 = np.nan
+    if hist:
+        if len(hist) > 0:
+            f1 = float(hist[0]["fitness"])
+        if len(hist) > 1:
+            f2 = float(hist[1]["fitness"])
+        if len(hist) > 2:
+            f3 = float(hist[2]["fitness"])
+    else:
+        f1 = float(row["gate_fitness"])
+    return {
+        "sample_id": stem,
+        "class_name": cname,
+        "base_fitness": float(row["baseline_fitness"]),
+        "base_rmse": float(row["baseline_inlier_rmse"]),
+        "final_iter_count": int(row["iter_count"]),
+        "gate_passed": bool(row["gate_accepted"]),
+        "iter_1_fitness": f1,
+        "iter_2_fitness": f2,
+        "iter_3_fitness": f3,
+        "ours_final_fitness": float(row["ours_fitness"]),
+        "ours_final_rmse": float(row["ours_inlier_rmse"]),
+    }
+
+
+def _finalize_pose_logging_to_csv(
+    rows: List[Dict[str, object]],
+    *,
+    iterative_refine: bool,
+    max_iter: int,
+) -> None:
+    """Write ``results/pose_sample_details.csv`` and ``results/pose_iter_summary.csv``, print dynamics."""
+    os.makedirs(_RESULTS_DIR, exist_ok=True)
+    detail_recs = [_pose_eval_row_to_detail(r) for r in rows]
+    df_detail = pd.DataFrame(detail_recs)
+    path_detail = os.path.join(_RESULTS_DIR, "pose_sample_details.csv")
+    df_detail.to_csv(path_detail, index=False)
+    print(f"Wrote sample details: {path_detail}")
+
+    n = len(rows)
+    if n == 0:
+        empty_sum = pd.DataFrame(
+            [
+                {
+                    "n_samples": 0,
+                    "iterative_refine_flag": iterative_refine,
+                    "configured_max_iter": int(max_iter),
+                    "pct_pass_gate_when_iter_eq_1": np.nan,
+                    "pct_pass_gate_when_iter_eq_2": np.nan,
+                    "pct_pass_gate_when_iter_eq_3": np.nan,
+                    "pct_fallback_timeout_no_gate": np.nan,
+                    "mean_delta_gate_fitness_iter1_to_iter2": np.nan,
+                    "n_samples_with_iter_ge_2_for_delta12": 0,
+                    "mean_delta_gate_fitness_iter2_to_iter3": np.nan,
+                    "n_samples_with_iter_ge_3_for_delta23": 0,
+                }
+            ]
+        )
+        empty_sum.to_csv(os.path.join(_RESULTS_DIR, "pose_iter_summary.csv"), index=False)
+        print("Skipped iteration dynamics (no successful samples).\n")
+        return
+
+    # Iteration dynamics (meaningful counts when iterative_refine captures multi-step refine)
+    rdf = pd.DataFrame(detail_recs)
+    gpass = rdf["gate_passed"].astype(bool)
+    ic = rdf["final_iter_count"]
+
+    pct1 = float((gpass & (ic == 1)).sum()) / n * 100.0
+    pct2 = float((gpass & (ic == 2)).sum()) / n * 100.0
+    pct3 = float((gpass & (ic == 3)).sum()) / n * 100.0
+
+    final_gates = [str(r.get("final_gate", "")) for r in rows]
+    # Fallback-after-max-iter: gate never passed AND loop exhausted with TIMEOUT (iter semantics)
+    fb_mask = [(not bool(r["gate_accepted"])) and fg == "TIMEOUT" for r, fg in zip(rows, final_gates)]
+    pct_fb = float(sum(fb_mask)) / n * 100.0
+
+    # Mean fitness gain iter1→iter2 among samples that actually ran iteration 2 (finite iter_2 fitness)
+    m12 = rdf[
+        np.isfinite(rdf["iter_1_fitness"].to_numpy(dtype=float))
+        & np.isfinite(rdf["iter_2_fitness"].to_numpy(dtype=float))
+    ]
+    delta_12 = (
+        float((m12["iter_2_fitness"] - m12["iter_1_fitness"]).mean())
+        if len(m12) > 0
+        else np.nan
+    )
+
+    m23 = rdf[
+        np.isfinite(rdf["iter_2_fitness"].to_numpy(dtype=float))
+        & np.isfinite(rdf["iter_3_fitness"].to_numpy(dtype=float))
+    ]
+    delta_23 = (
+        float((m23["iter_3_fitness"] - m23["iter_2_fitness"]).mean())
+        if len(m23) > 0
+        else np.nan
+    )
+
+    print("\n=== Iteration dynamics summary (successful eval samples only) ===")
+    print(f"  n_samples={n}  iterative_refine={iterative_refine}  max_iter={max_iter}")
+    print(f"  % Gate OK after iteration 1: {pct1:.2f}%")
+    print(f"  % Gate OK after iteration 2: {pct2:.2f}%")
+    print(f"  % Gate OK after iteration 3: {pct3:.2f}%")
+    print(f"  % Exhausted iterations without Gate OK (fallback, TIMEOUT): {pct_fb:.2f}%")
+    if iterative_refine and len(m12):
+        print(
+            f"  Mean Δ Gate fitness (iter1→iter2), among samples reaching iter ≥2: {delta_12:.6f}  (n={len(m12)})"
+        )
+    elif iterative_refine:
+        print("  Mean Δ Gate fitness (iter1→iter2): — (no samples with both iter_1 & iter_2)")
+    else:
+        print(
+            "  Mean Δ Gate fitness (iter1→iter2): — (multi-iter deltas require --iterative-refine)"
+        )
+    if iterative_refine and len(m23):
+        print(f"  Mean Δ Gate fitness (iter2→iter3), samples reaching iter 3: {delta_23:.6f}  (n={len(m23)})")
+
+    summary_wide = pd.DataFrame(
+        [
+            {
+                "n_samples": n,
+                "iterative_refine_flag": iterative_refine,
+                "configured_max_iter": int(max_iter),
+                "pct_pass_gate_when_iter_eq_1": pct1,
+                "pct_pass_gate_when_iter_eq_2": pct2,
+                "pct_pass_gate_when_iter_eq_3": pct3,
+                "pct_fallback_timeout_no_gate": pct_fb,
+                "mean_delta_gate_fitness_iter1_to_iter2": delta_12,
+                "n_samples_with_iter_ge_2_for_delta12": len(m12),
+                "mean_delta_gate_fitness_iter2_to_iter3": delta_23,
+                "n_samples_with_iter_ge_3_for_delta23": len(m23),
+            }
+        ]
+    )
+    path_sum = os.path.join(_RESULTS_DIR, "pose_iter_summary.csv")
+    summary_wide.to_csv(path_sum, index=False)
+    print(f"Wrote iteration summary: {path_sum}\n")
+
+
 def print_batch_summary(rows: List[Dict[str, object]]) -> None:
     """Baseline（T_coarse→ICP）vs Ours（SNet+Gate→final ICP）；Macro=各类指标类均值再平均。"""
     if not rows:
@@ -610,6 +755,7 @@ def main() -> None:
                 "gate_fitness": out["gate_fitness"],
                 "iter_count": out["iter_count"],
                 "iter_history": out.get("iter_history", []),
+                "final_gate": out.get("final_gate", ""),
             })
 
         print(f"\n完成: success={len(rows)}  skip={n_skip}")
@@ -633,6 +779,11 @@ def main() -> None:
                         prev_rmse = rmse
             print(f"iter-report-csv: {report_path}")
         print_batch_summary(rows)
+        _finalize_pose_logging_to_csv(
+            rows,
+            iterative_refine=args.iterative_refine,
+            max_iter=int(args.max_iter),
+        )
         return
 
     if not args.stem:

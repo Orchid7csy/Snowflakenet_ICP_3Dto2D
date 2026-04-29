@@ -15,11 +15,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
+_RESULTS_DIR = os.path.join(_PROJECT_ROOT, "results")
 _SNET_ROOT = os.path.join(_PROJECT_ROOT, "Snet", "SnowflakeNet-main")
 _DEFAULT_OFFICIAL_CKPT = os.path.join(
     _SNET_ROOT, "completion", "checkpoints", "ckpt-best-pcn-cd_l1.pth",
@@ -190,6 +192,123 @@ def _print_single_table(
     print("=" * w + "\n")
 
 
+def _save_completion_summary_single(stats: EvalStats, *, split: str, input_mode: str, label: str) -> None:
+    """Write ``results/completion_summary.csv`` for one-model evaluation."""
+    os.makedirs(_RESULTS_DIR, exist_ok=True)
+    merged: List[Dict[str, object]] = []
+    for cname, mean, n in stats.class_rows:
+        merged.append(
+            {
+                "row_kind": "class",
+                "split": split,
+                "input_mode": input_mode,
+                "class_name": cname,
+                "mean_cd_l1_x1e3_single": float(mean) if np.isfinite(mean) else np.nan,
+                "mean_cd_l1_x1e3_official": np.nan,
+                "mean_cd_l1_x1e3_ours": np.nan,
+                "sample_count": int(n),
+                "checkpoint": os.path.abspath(label),
+            }
+        )
+    merged.append(
+        {
+            "row_kind": "macro",
+            "split": split,
+            "input_mode": input_mode,
+            "class_name": "MacroAvg",
+            "mean_cd_l1_x1e3_single": float(stats.macro) if np.isfinite(stats.macro) else np.nan,
+            "mean_cd_l1_x1e3_official": np.nan,
+            "mean_cd_l1_x1e3_ours": np.nan,
+            "sample_count": 0,
+            "checkpoint": os.path.abspath(label),
+        }
+    )
+    n_micro = sum(int(r["sample_count"]) for r in merged if str(r["row_kind"]) == "class")
+    merged.append(
+        {
+            "row_kind": "micro",
+            "split": split,
+            "input_mode": input_mode,
+            "class_name": "MicroAvg",
+            "mean_cd_l1_x1e3_single": float(stats.micro) if np.isfinite(stats.micro) else np.nan,
+            "mean_cd_l1_x1e3_official": np.nan,
+            "mean_cd_l1_x1e3_ours": np.nan,
+            "sample_count": int(n_micro),
+            "checkpoint": os.path.abspath(label),
+        }
+    )
+    outp = os.path.join(_RESULTS_DIR, "completion_summary.csv")
+    pd.DataFrame(merged).to_csv(outp, index=False)
+    print(f"Wrote completion summary: {outp}")
+
+
+def _save_completion_summary_compare(
+    stats_official: EvalStats,
+    stats_ours: EvalStats,
+    *,
+    split: str,
+    input_mode: str,
+    path_official: str,
+    path_ours: str,
+) -> None:
+    """Write ``results/completion_summary.csv`` for official-vs-ours columns."""
+    os.makedirs(_RESULTS_DIR, exist_ok=True)
+    merged: List[Dict[str, object]] = []
+    for (c_o, m_o, n_o), (c_u, m_u, n_u) in zip(
+        stats_official.class_rows, stats_ours.class_rows
+    ):
+        assert c_o == c_u
+        merged.append(
+            {
+                "row_kind": "class",
+                "split": split,
+                "input_mode": input_mode,
+                "class_name": c_o,
+                "mean_cd_l1_x1e3_single": np.nan,
+                "mean_cd_l1_x1e3_official": float(m_o) if np.isfinite(m_o) else np.nan,
+                "mean_cd_l1_x1e3_ours": float(m_u) if np.isfinite(m_u) else np.nan,
+                "sample_count": int(max(n_o, n_u)),
+                "checkpoint": f"{os.path.abspath(path_official)} | {os.path.abspath(path_ours)}",
+            }
+        )
+    merged.append(
+        {
+            "row_kind": "macro",
+            "split": split,
+            "input_mode": input_mode,
+            "class_name": "MacroAvg",
+            "mean_cd_l1_x1e3_single": np.nan,
+            "mean_cd_l1_x1e3_official": float(stats_official.macro)
+            if np.isfinite(stats_official.macro)
+            else np.nan,
+            "mean_cd_l1_x1e3_ours": float(stats_ours.macro) if np.isfinite(stats_ours.macro) else np.nan,
+            "sample_count": 0,
+            "checkpoint": f"{os.path.abspath(path_official)} | {os.path.abspath(path_ours)}",
+        }
+    )
+    n_micro = sum(int(r["sample_count"]) for r in merged if str(r["row_kind"]) == "class")
+    merged.append(
+        {
+            "row_kind": "micro",
+            "split": split,
+            "input_mode": input_mode,
+            "class_name": "MicroAvg",
+            "mean_cd_l1_x1e3_single": np.nan,
+            "mean_cd_l1_x1e3_official": float(stats_official.micro)
+            if np.isfinite(stats_official.micro)
+            else np.nan,
+            "mean_cd_l1_x1e3_ours": float(stats_ours.micro)
+            if np.isfinite(stats_ours.micro)
+            else np.nan,
+            "sample_count": int(n_micro),
+            "checkpoint": f"{os.path.abspath(path_official)} | {os.path.abspath(path_ours)}",
+        }
+    )
+    outp = os.path.join(_RESULTS_DIR, "completion_summary.csv")
+    pd.DataFrame(merged).to_csv(outp, index=False)
+    print(f"Wrote completion summary: {outp}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
@@ -290,6 +409,14 @@ def main() -> None:
             label_official="official",
             label_ours="ours (finetuned)",
         )
+        _save_completion_summary_compare(
+            stats_o,
+            stats_u,
+            split=args.split,
+            input_mode=args.input_mode,
+            path_official=args.official_ckpt,
+            path_ours=args.ours_ckpt,
+        )
         return
 
     single_ckpt = args.ckpt if args.ckpt else _DEFAULT_OFFICIAL_CKPT
@@ -304,6 +431,12 @@ def main() -> None:
         desc="eval cd-l1",
     )
     _print_single_table(
+        stats,
+        split=args.split,
+        input_mode=args.input_mode,
+        label=single_ckpt,
+    )
+    _save_completion_summary_single(
         stats,
         split=args.split,
         input_mode=args.input_mode,
