@@ -390,15 +390,17 @@ def main() -> int:
     ap.add_argument("--sample-index", type=int, default=0, help="按名字排序后的第几条")
     ap.add_argument(
         "--ckpt-pretrain",
+        "--official-ckpt",
         default=os.path.join(
             _SNET_ROOT, "completion", "checkpoints", "ckpt-best-pcn-cd_l1.pth"
         ),
-        help="预训练权重",
+        help="SnowflakeNet 官方 PCN 预训练权重",
     )
     ap.add_argument(
         "--ckpt-finetune",
-        default=os.path.join(_PROJECT_ROOT, "checkpoints", "snet_finetune", "ckpt-best.pth"),
-        help="微调 best 权重（需已训练导出）",
+        "--ours-ckpt",
+        default=os.path.join(_PROJECT_ROOT, "checkpoints", "ckpt-best.pth"),
+        help="微调 best 权重（默认项目根 checkpoints/ckpt-best.pth）",
     )
     ap.add_argument("--input-mode", choices=("direct", "upsample", "legacy"), default="direct")
     ap.add_argument("--n-input-points", type=int, default=2048)
