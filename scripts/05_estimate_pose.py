@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 from collections import defaultdict
@@ -122,6 +123,7 @@ def run_one(
     convergence_eps_rot: float,
     convergence_eps_trans: float,
     iterative_refine: bool,
+    iter_select: str,
     *,
     input_resample_mode: str = "fps",
     do_comp_filter: bool = False,
@@ -177,16 +179,19 @@ def run_one(
     completed_dir = _ensure_dir(completed_dir)
     os.makedirs(completed_dir, exist_ok=True)
     comp_path = os.path.join(completed_dir, f"{stem}_completed.npy")
+    iter_history: List[Dict[str, float | int | bool]] = []
     if iterative_refine:
         T_current = t_coarse.copy()
+        best_t = T_current.copy()
+        iter_t_list: List[np.ndarray] = []
+        best_fit = -1.0
+        best_rmse = float("inf")
         for iter_idx in range(int(max_iter)):
             t_current_inv = _invert_row_transform(T_current)
             p_rough_iter = _apply_row_transform(p_obs_w, t_current_inv)
-            p_input_cano_iter, _cad_cano_iter, c_iter, scale_iter = prep.normalize_by_complete(
-                p_cad, p_rough_iter
-            )
-            scale_k = np.float32(scale_iter)
-            centroid_k = np.asarray(c_iter, dtype=np.float32).reshape(1, 3)
+            p_input_cano_iter, norm_meta_iter = prep.normalize_by_complete(p_rough_iter, p_cad)
+            scale_k = np.float32(norm_meta_iter["scale"])
+            centroid_k = np.asarray(norm_meta_iter["centroid"], dtype=np.float32).reshape(1, 3)
             p_in_iter = _resample_2048(p_input_cano_iter, seed=iter_idx, mode=input_resample_mode)
             p_in_vis = p_in_iter
             pred_cano_iter = complete_points(model, p_in_iter)
@@ -211,6 +216,20 @@ def run_one(
             converged = rot_deg < float(convergence_eps_rot) and trans_norm < float(convergence_eps_trans)
             gate_ok = float(reg_gate_iter.fitness) >= float(gate_fitness)
             last_gate_fitness = float(reg_gate_iter.fitness)
+            iter_history.append({
+                "iter_idx": iter_idx,
+                "fitness": float(reg_gate_iter.fitness),
+                "rmse": float(reg_gate_iter.inlier_rmse),
+                "gate_ok": bool(gate_ok),
+                "converged": bool(converged),
+            })
+            iter_t_list.append(t_next.copy())
+            if (float(reg_gate_iter.fitness) > best_fit) or (
+                np.isclose(float(reg_gate_iter.fitness), best_fit) and float(reg_gate_iter.inlier_rmse) < best_rmse
+            ):
+                best_fit = float(reg_gate_iter.fitness)
+                best_rmse = float(reg_gate_iter.inlier_rmse)
+                best_t = t_next.copy()
             print(
                 f"[Iter {iter_idx}] fitness={float(reg_gate_iter.fitness):.3f}  "
                 f"rmse={float(reg_gate_iter.inlier_rmse):.3f}  gate={'OK' if gate_ok else 'FAIL'}  "
@@ -231,13 +250,18 @@ def run_one(
         else:
             gate_status = "TIMEOUT"
             T_for_final_icp = T_current  # [from last iter, gate timeout]
+        if not gate_ok and iter_select == "best_fitness":
+            T_for_final_icp = best_t  # [from Gate-ICP iter]
+        elif not gate_ok and iter_select == "best_rmse" and iter_history:
+            best_idx = int(np.argmin([float(x["rmse"]) for x in iter_history]))
+            T_for_final_icp = np.asarray(iter_t_list[best_idx], dtype=np.float64)  # [from Gate-ICP iter]
     else:
         # 原单次 Gate-ICP（保留）
         t_coarse_inv = _invert_row_transform(t_coarse)
         p_rough = _apply_row_transform(p_obs_w, t_coarse_inv)
-        p_input_cano, _cad_cano, c_cano, scale_cano = prep.normalize_by_complete(p_cad, p_rough)
-        scale_cano = np.float32(scale_cano)
-        centroid_cano = np.asarray(c_cano, dtype=np.float32).reshape(1, 3)
+        p_input_cano, norm_meta = prep.normalize_by_complete(p_rough, p_cad)
+        scale_cano = np.float32(norm_meta["scale"])
+        centroid_cano = np.asarray(norm_meta["centroid"], dtype=np.float32).reshape(1, 3)
         p_in = _resample_2048(p_input_cano, seed=0, mode=input_resample_mode)
         p_in_vis = p_in
         p_pred_cano = complete_points(model, p_in)
@@ -307,6 +331,7 @@ def run_one(
         "T_icp": t,
         "T_far_4x4": t_far,
         "meta_path": meta_path,
+        "iter_history": iter_history,
     }
 
 
@@ -457,54 +482,13 @@ def main() -> None:
     parser.add_argument("--icp-iter", type=int, default=50)
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--fpfh-voxel", type=float, default=0.03)
-    parser.add_argument(
-        "--gate-fitness",
-        "--gate_fitness",
-        dest="gate_fitness",
-        type=float,
-        default=0.3,
-        help=(
-            "Gate-ICP 相对 complete 预测的 fitness 阈值。默认路径：未达阈值则 Final-ICP 回退 T_coarse。"
-            " 迭代精炼：首轮即达则立即结束 refine（不会在 OK 后再多跑 SNet）"
-        ),
-    )
-    parser.add_argument(
-        "--max-iter",
-        "--max_iter",
-        dest="max_iter",
-        type=int,
-        default=3,
-        help=(
-            "仅 --iterative-refine：normalize→SNet→Gate 的最大多轮次数（不是失败重试上限）。"
-            " 跑满未提前退出则 TIMEOUT"
-        ),
-    )
-    parser.add_argument(
-        "--convergence-eps-rot",
-        "--convergence_eps_rot",
-        dest="convergence_eps_rot",
-        type=float,
-        default=1.0,
-        help="仅迭代精炼：相邻轮相对位姿 dT 的旋转角阈值（度），与 --convergence-eps-trans 同时为真则可 CONVERGED 退出",
-    )
-    parser.add_argument(
-        "--convergence-eps-trans",
-        "--convergence_eps_trans",
-        dest="convergence_eps_trans",
-        type=float,
-        default=0.001,
-        help="仅迭代精炼：dT 的平移范数阈值（与 coarse 尺度一致的单位）",
-    )
-    parser.add_argument(
-        "--iterative-refine",
-        action="store_true",
-        help=(
-            "多轮 refine：每轮 T_current 下 normalize→SNet→Gate-ICP 得 t_next；"
-            "Gate OK 即停；FAIL 则 T←t_next 继续或达收敛/上限；"
-            "TIMEOUT 时 Final-ICP 用末次 t_next（非 T_coarse，也非历史最优 fitness）。"
-            "见模块 docstring"
-        ),
-    )
+    parser.add_argument("--gate-fitness", "--gate_fitness", dest="gate_fitness", type=float, default=0.3)
+    parser.add_argument("--max-iter", "--max_iter", dest="max_iter", type=int, default=3)
+    parser.add_argument("--convergence-eps-rot", "--convergence_eps_rot", dest="convergence_eps_rot", type=float, default=1.0)
+    parser.add_argument("--convergence-eps-trans", "--convergence_eps_trans", dest="convergence_eps_trans", type=float, default=0.001)
+    parser.add_argument("--iterative-refine", action="store_true", help="启用迭代精炼 Gate-ICP")
+    parser.add_argument("--iter-select", default="best_fitness", choices=("last", "best_fitness", "best_rmse"))
+    parser.add_argument("--iter-report-csv", default="", help="保存每轮迭代指标报告到 CSV（建议配合 --eval-all）")
     parser.add_argument(
         "--input-resample",
         default="fps",
@@ -602,6 +586,7 @@ def main() -> None:
                     convergence_eps_rot=args.convergence_eps_rot,
                     convergence_eps_trans=args.convergence_eps_trans,
                     iterative_refine=args.iterative_refine,
+                    iter_select=args.iter_select,
                     input_resample_mode=args.input_resample,
                     do_comp_filter=args.legacy_comp_filter,
                     do_reg_filter=not args.no_reg_filter,
@@ -622,9 +607,29 @@ def main() -> None:
                 "gate_accepted": out["gate_accepted"],
                 "gate_fitness": out["gate_fitness"],
                 "iter_count": out["iter_count"],
+                "iter_history": out.get("iter_history", []),
             })
 
         print(f"\n完成: success={len(rows)}  skip={n_skip}")
+        if args.iter_report_csv:
+            report_path = os.path.abspath(args.iter_report_csv)
+            os.makedirs(os.path.dirname(report_path), exist_ok=True)
+            with open(report_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["stem", "class", "iter_idx", "fitness", "rmse", "delta_fitness", "delta_rmse"])
+                for r in rows:
+                    hist = list(r.get("iter_history", []))
+                    prev_fit = None
+                    prev_rmse = None
+                    for h in hist:
+                        fit = float(h["fitness"])
+                        rmse = float(h["rmse"])
+                        d_fit = 0.0 if prev_fit is None else fit - prev_fit
+                        d_rmse = 0.0 if prev_rmse is None else prev_rmse - rmse
+                        writer.writerow([r["stem"], r["class"], h["iter_idx"], fit, rmse, d_fit, d_rmse])
+                        prev_fit = fit
+                        prev_rmse = rmse
+            print(f"iter-report-csv: {report_path}")
         print_batch_summary(rows)
         return
 
@@ -663,6 +668,7 @@ def main() -> None:
         convergence_eps_rot=args.convergence_eps_rot,
         convergence_eps_trans=args.convergence_eps_trans,
         iterative_refine=args.iterative_refine,
+        iter_select=args.iter_select,
         input_resample_mode=args.input_resample,
         do_comp_filter=args.legacy_comp_filter,
         do_reg_filter=not args.no_reg_filter,
