@@ -123,6 +123,20 @@ def run_one(
     )
     t_coarse = np.asarray(ransac.transformation, dtype=np.float64)
 
+    # Baseline（对照）：同一 T_coarse，CAD ↔ obs_w Point-to-Plane ICP（参数与最终 ICP 一致；无 SNet）
+    src_cad_w = to_o3d_pcd(p_cad, color=(0.2, 0.8, 1.0))
+    tgt_obs_w = to_o3d_pcd(p_obs_w, color=(1.0, 0.0, 0.0))
+    reg_baseline = icp_refine(
+        source=src_cad_w,
+        target=tgt_obs_w,
+        init_transform=t_coarse,
+        max_correspondence_distance=icp_dist,
+        mode=icp_mode,
+        max_iteration=icp_iter,
+    )
+    baseline_fitness = float(reg_baseline.fitness)
+    baseline_inlier_rmse = float(reg_baseline.inlier_rmse)
+
     # 2) obs_w 摆正到粗物体系，再 canonical 归一化，并固定 2048 点
     t_coarse_inv = _invert_row_transform(t_coarse)
     p_rough = _apply_row_transform(p_obs_w, t_coarse_inv)
@@ -188,15 +202,25 @@ def run_one(
             width=1280, height=720,
         )
     t_far = meta.get("T_far_4x4")
+    ours_fit = float(reg.fitness)
+    ours_rmse = float(reg.inlier_rmse)
     return {
-        "stem": stem, "completed_path": comp_path,
-        "icp_fitness": float(reg.fitness), "icp_inlier_rmse": float(reg.inlier_rmse),
+        "stem": stem,
+        "completed_path": comp_path,
+        "baseline_fitness": baseline_fitness,
+        "baseline_inlier_rmse": baseline_inlier_rmse,
+        "ours_fitness": ours_fit,
+        "ours_inlier_rmse": ours_rmse,
+        "icp_fitness": ours_fit,
+        "icp_inlier_rmse": ours_rmse,
         "T_coarse": t_coarse,
         "T_gate": np.asarray(reg_gate.transformation, dtype=np.float64),
         "gate_fitness": float(reg_gate.fitness),
         "gate_threshold": float(gate_fitness),
         "gate_accepted": bool(gate_ok),
-        "T_icp": t, "T_far_4x4": t_far, "meta_path": meta_path,
+        "T_icp": t,
+        "T_far_4x4": t_far,
+        "meta_path": meta_path,
     }
 
 
@@ -220,7 +244,7 @@ def discover_valid_stems(data_root: str, split: str) -> List[str]:
 
 
 def print_batch_summary(rows: List[Dict[str, object]]) -> None:
-    """按 PCN 类汇总 icp_fitness / inlier_rmse / gate 接受率；Macro=各类均值，Micro=全体样本均值。"""
+    """Baseline（T_coarse→ICP）vs Ours（SNet+Gate→final ICP）；Macro=各类指标类均值再平均。"""
     if not rows:
         print("无成功样本。")
         return
@@ -228,61 +252,80 @@ def print_batch_summary(rows: List[Dict[str, object]]) -> None:
     for r in rows:
         by_class[str(r["class"])].append(r)
 
-    print("\n" + "=" * 92)
+    w = 118
+    print("\n" + "=" * w)
     print(
-        f"{'Class':<12} {'n':>6} {'icp_fitness':>14} {'inlier_rmse':>14} {'gate_ok%':>10}  "
-        f"(各类均为该类样本均值)"
+        "Baseline = FPFH 粗配 T_coarse 后直接 ICP(CAD→obs_w)；"
+        "Ours = SNet 补全 + Gate-ICP 初值后的最终 ICP(CAD→obs_w)"
     )
-    print("-" * 92)
+    hdr = (
+        f"{'Class':<12} {'n':>6} "
+        f"{'Base_Fit':>13} {'Ours_Fit':>13} {'Base_RMSE':>13} {'Ours_RMSE':>13} {'Gate_OK%':>9}"
+    )
+    print(hdr)
+    print("-" * w)
 
-    class_mean_fit: List[float] = []
-    class_mean_rmse: List[float] = []
+    class_mean_bf: List[float] = []
+    class_mean_of: List[float] = []
+    class_mean_br: List[float] = []
+    class_mean_or: List[float] = []
+
+    def _agg(rs: List[Dict[str, object]]) -> tuple[float, float, float, float, float]:
+        nloc = len(rs)
+        bf = float(np.mean([float(x["baseline_fitness"]) for x in rs]))
+        of = float(np.mean([float(x["ours_fitness"]) for x in rs]))
+        br = float(np.mean([float(x["baseline_inlier_rmse"]) for x in rs]))
+        ort = float(np.mean([float(x["ours_inlier_rmse"]) for x in rs]))
+        gk = 100.0 * float(np.mean([1.0 if bool(x["gate_accepted"]) else 0.0 for x in rs]))
+        return bf, of, br, ort, gk
 
     for _syn, cname in TAXONOMY_TABLE1:
         rs = by_class.get(cname, [])
         if not rs:
-            print(f"{cname:<12} {0:6d} {'--':>14} {'--':>14} {'--':>10}")
+            print(
+                f"{cname:<12} {0:6d} "
+                f"{'--':>13} {'--':>13} {'--':>13} {'--':>13} {'--':>9}"
+            )
             continue
         n = len(rs)
-        mf = float(np.mean([float(x["icp_fitness"]) for x in rs]))
-        mr = float(np.mean([float(x["icp_inlier_rmse"]) for x in rs]))
-        gk = 100.0 * float(
-            np.mean([1.0 if bool(x["gate_accepted"]) else 0.0 for x in rs])
-        )
-        class_mean_fit.append(mf)
-        class_mean_rmse.append(mr)
-        print(f"{cname:<12} {n:6d} {mf:14.6f} {mr:14.6f} {gk:9.1f}%")
+        bf, of, br, ort, gk = _agg(rs)
+        class_mean_bf.append(bf)
+        class_mean_of.append(of)
+        class_mean_br.append(br)
+        class_mean_or.append(ort)
+        print(f"{cname:<12} {n:6d} {bf:13.6f} {of:13.6f} {br:13.6f} {ort:13.6f} {gk:8.1f}%")
 
     unk = [k for k in by_class if k not in {t[1] for t in TAXONOMY_TABLE1}]
     for u in sorted(unk):
         rs = by_class[u]
         n = len(rs)
-        mf = float(np.mean([float(x["icp_fitness"]) for x in rs]))
-        mr = float(np.mean([float(x["icp_inlier_rmse"]) for x in rs]))
-        gk = 100.0 * float(
-            np.mean([1.0 if bool(x["gate_accepted"]) else 0.0 for x in rs])
-        )
-        print(f"{u:<12} {n:6d} {mf:14.6f} {mr:14.6f} {gk:9.1f}%")
+        bf, of, br, ort, gk = _agg(rs)
+        print(f"{u:<12} {n:6d} {bf:13.6f} {of:13.6f} {br:13.6f} {ort:13.6f} {gk:8.1f}%")
 
-    print("-" * 92)
-    macro_f = float(np.mean(class_mean_fit)) if class_mean_fit else float("nan")
-    macro_r = float(np.mean(class_mean_rmse)) if class_mean_rmse else float("nan")
-    micro_f = float(np.mean([float(r["icp_fitness"]) for r in rows]))
-    micro_r = float(np.mean([float(r["icp_inlier_rmse"]) for r in rows]))
+    print("-" * w)
+    macro_bf = float(np.mean(class_mean_bf)) if class_mean_bf else float("nan")
+    macro_of = float(np.mean(class_mean_of)) if class_mean_of else float("nan")
+    macro_br = float(np.mean(class_mean_br)) if class_mean_br else float("nan")
+    macro_or = float(np.mean(class_mean_or)) if class_mean_or else float("nan")
+
+    micro_bf = float(np.mean([float(r["baseline_fitness"]) for r in rows]))
+    micro_of = float(np.mean([float(r["ours_fitness"]) for r in rows]))
+    micro_br = float(np.mean([float(r["baseline_inlier_rmse"]) for r in rows]))
+    micro_or = float(np.mean([float(r["ours_inlier_rmse"]) for r in rows]))
     micro_g = 100.0 * float(
         np.mean([1.0 if bool(r["gate_accepted"]) else 0.0 for r in rows])
     )
     n_all = len(rows)
 
     print(
-        f"{'MacroAvg':<12} {'—':>6} {macro_f:14.6f} {macro_r:14.6f} {'—':>10}  "
-        f"#classes={len(class_mean_fit)}"
+        f"{'MacroAvg':<12} {'—':>6} {macro_bf:13.6f} {macro_of:13.6f} {macro_br:13.6f} {macro_or:13.6f} "
+        f"{'—':>9}  (#cls={len(class_mean_bf)})"
     )
     print(
-        f"{'MicroAvg':<12} {n_all:6d} {micro_f:14.6f} {micro_r:14.6f} {micro_g:9.1f}%  "
-        "(全体样本；含 unknown 等非表 8 类)"
+        f"{'MicroAvg':<12} {n_all:6d} {micro_bf:13.6f} {micro_of:13.6f} {micro_br:13.6f} {micro_or:13.6f} "
+        f"{micro_g:8.1f}%"
     )
-    print("=" * 92 + "\n")
+    print("=" * w + "\n")
 
 
 def main() -> None:
@@ -433,8 +476,10 @@ def main() -> None:
             rows.append({
                 "class": cname,
                 "stem": stem,
-                "icp_fitness": out["icp_fitness"],
-                "icp_inlier_rmse": out["icp_inlier_rmse"],
+                "baseline_fitness": out["baseline_fitness"],
+                "baseline_inlier_rmse": out["baseline_inlier_rmse"],
+                "ours_fitness": out["ours_fitness"],
+                "ours_inlier_rmse": out["ours_inlier_rmse"],
                 "gate_accepted": out["gate_accepted"],
                 "gate_fitness": out["gate_fitness"],
             })
@@ -482,7 +527,14 @@ def main() -> None:
     print("=== Result ===")
     print(f"stem: {out['stem']}")
     print(f"completed: {out['completed_path']}")
-    print(f"fitness: {out['icp_fitness']:.6f}  inlier_rmse: {out['icp_inlier_rmse']:.6f}")
+    print(
+        f"Baseline ICP (init=T_coarse, CAD↔obs_w): fitness={out['baseline_fitness']:.6f}  "
+        f"inlier_rmse={out['baseline_inlier_rmse']:.6f}"
+    )
+    print(
+        f"Ours pipeline (SNet+Gate→final ICP): fitness={out['ours_fitness']:.6f}  "
+        f"inlier_rmse={out['ours_inlier_rmse']:.6f}"
+    )
     print("T_coarse (4x4, CAD -> obs_w, FPFH-RANSAC):")
     print(out["T_coarse"])
     print(
