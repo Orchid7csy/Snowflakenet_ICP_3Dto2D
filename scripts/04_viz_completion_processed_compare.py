@@ -135,10 +135,24 @@ def _viz_four_columns(
         out_root = os.path.abspath(save_dir)
         os.makedirs(out_root, exist_ok=True)
         base = "".join((c if c.isalnum() or c in "-_" else "_" for c in stem))[:180]
-        for label, pts, _c in geoms:
+        for label, pts, col in geoms:
             path = os.path.join(out_root, f"{base}__processed_compare__{label}.ply")
-            o3d.io.write_point_cloud(path, to_o3d_pcd(np.asarray(pts)))
+            o3d.io.write_point_cloud(path, to_o3d_pcd(np.asarray(pts), color=col))
             print(f"  wrote {path}")
+
+        pts_acc = []
+        col_acc = []
+        for _label, pts, rgb in geoms:
+            arr = np.asarray(pts, dtype=np.float64)
+            n = arr.shape[0]
+            pts_acc.append(arr)
+            col_acc.append(np.tile(np.asarray(rgb, dtype=np.float64), (n, 1)))
+        merged = o3d.geometry.PointCloud()
+        merged.points = o3d.utility.Vector3dVector(np.vstack(pts_acc))
+        merged.colors = o3d.utility.Vector3dVector(np.vstack(col_acc))
+        merge_path = os.path.join(out_root, f"{base}__processed_compare__merged_side_by_side.ply")
+        o3d.io.write_point_cloud(merge_path, merged)
+        print(f"  wrote {merge_path}  （单文件并排：红=input, 橙=official, 绿=ours, 蓝=GT）")
         return
 
     import open3d as o3d
