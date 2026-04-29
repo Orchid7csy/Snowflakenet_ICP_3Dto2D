@@ -189,9 +189,11 @@ def run_one(
         for iter_idx in range(int(max_iter)):
             t_current_inv = _invert_row_transform(T_current)
             p_rough_iter = _apply_row_transform(p_obs_w, t_current_inv)
-            p_input_cano_iter, norm_meta_iter = prep.normalize_by_complete(p_rough_iter, p_cad)
-            scale_k = np.float32(norm_meta_iter["scale"])
-            centroid_k = np.asarray(norm_meta_iter["centroid"], dtype=np.float32).reshape(1, 3)
+            p_input_cano_iter, _cad_cano_iter, c_iter, scale_iter = prep.normalize_by_complete(
+                p_cad, p_rough_iter
+            )
+            scale_k = np.float32(scale_iter)
+            centroid_k = np.asarray(c_iter, dtype=np.float32).reshape(1, 3)
             p_in_iter = _resample_2048(p_input_cano_iter, seed=iter_idx, mode=input_resample_mode)
             p_in_vis = p_in_iter
             pred_cano_iter = complete_points(model, p_in_iter)
@@ -259,9 +261,9 @@ def run_one(
         # 原单次 Gate-ICP（保留）
         t_coarse_inv = _invert_row_transform(t_coarse)
         p_rough = _apply_row_transform(p_obs_w, t_coarse_inv)
-        p_input_cano, norm_meta = prep.normalize_by_complete(p_rough, p_cad)
-        scale_cano = np.float32(norm_meta["scale"])
-        centroid_cano = np.asarray(norm_meta["centroid"], dtype=np.float32).reshape(1, 3)
+        p_input_cano, _cad_cano, c_cano, scale_cano_scalar = prep.normalize_by_complete(p_cad, p_rough)
+        scale_cano = np.float32(scale_cano_scalar)
+        centroid_cano = np.asarray(c_cano, dtype=np.float32).reshape(1, 3)
         p_in = _resample_2048(p_input_cano, seed=0, mode=input_resample_mode)
         p_in_vis = p_in
         p_pred_cano = complete_points(model, p_in)
