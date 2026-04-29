@@ -1,11 +1,24 @@
 """
-3D 补全 + 位姿估计闭环：
-  1) CAD(complete) ↔ obs_w 做 FPFH 粗配准，得 T_coarse；
-  2) 用 T_coarse^-1 将 obs_w 摆正到粗物体系，再按 meta(centroid_cano/scale_cano)归一化到 canonical；
-  3) canonical 输入固定 2048 点送入 SNet；
-  4) 反归一化严格使用: P_pred_w = (P_pred_cano * S + C) * T_coarse；
-  5) Gate-ICP: CAD ↔ P_pred_w，fitness 低于阈值时回退 T_coarse；
-  6) 最终 ICP: CAD ↔ 原始 obs_w 锁定位姿。
+3D 补全 + 位姿估计闭环（最终以 CAD ↔ ``obs_w`` 的 Point-to-* ICP 锁定位姿）。
+
+**默认路径**（不传 ``--iterative-refine``）— 单次 SNet + 单次 Gate-ICP：
+
+  1) CAD(complete) ↔ ``obs_w``：FPFH 粗配准得 ``T_coarse``。
+  2) ``T_coarse^{-1}`` 将 ``obs_w`` 摆到粗物体系，``normalize_by_complete`` → canonical，
+     2048 点送入 SNet，反归一化得 ``P_pred_w``。
+  3) Gate-ICP（CAD ↔ ``P_pred_w``，初值 ``T_coarse``）：若本轮 Gate fitness ≥ ``--gate-fitness``
+     则用 Gate 输出的位姿；**否则 Final-ICP 回退 ``T_coarse``**。
+  4) Final-ICP（CAD ↔ 原始 ``obs_w``）：初值为上一步选定的矩阵。
+
+**迭代精炼**（``--iterative-refine``）：FPFH 后以 ``T_current = T_coarse`` 起，至多 ``--max-iter`` 轮。
+每轮 ``normalize_by_complete`` → SNet → 反归一化 → Gate-ICP，产出 ``t_next``。
+
+  * **Gate OK**（fitness ≥ 阈值）：**立即跳出**（语义是「首达阈值即停」，不在 OK 后再跑额外 SNet/Gate）。
+  * **Gate 未 OK** 但若 ``dT = t_next @ inv(T_current)`` 的旋转角、平移同时小于
+    ``--convergence-eps-rot`` / ``--convergence-eps-trans``：以 ``CONVERGED`` 跳出，Final-ICP 用 ``t_next``。
+  * **否则**：``T_current ← t_next`` 再打一轮；FAIL 时不回 ``T_coarse``。
+  * **跑满仍未跳出**（``TIMEOUT``）：Final-ICP 初值为 **最后一轮的** ``T_current``（即链末 Gate-ICP 结果），
+    **不是** ``T_coarse``；也 **未** 在多轮间按 fitness 保留历史最优，仅末次（或提前 break 的那次）``t_next``。
 
 列举可选 stem::
 
@@ -116,6 +129,12 @@ def run_one(
     do_reg_filter: bool = True,
     reg_filter_cfg: RegistrationFilterConfig | None = None,
 ) -> dict:
+    """单样本：FPFH 粗配准 → （可选迭代）normalize+SNet+Gate → Final ICP。
+
+    ``iterative_refine=False`` 时与模块文档「默认路径」一致；Gate FAIL 则 Final-ICP 初值回 ``T_coarse``。
+
+    ``iterative_refine=True`` 时参见模块文档「迭代精炼」：首达 Gate OK 即结束循环；超时用末次 Gate
+    输出的 ``T_current``；不在轮间择优 fitness。"""
     p_obs_w = np.load(obs_path).astype(np.float32)
     meta = dict(np.load(meta_path, allow_pickle=True))
     source_complete = str(meta.get("source_complete", ""))
@@ -438,11 +457,54 @@ def main() -> None:
     parser.add_argument("--icp-iter", type=int, default=50)
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--fpfh-voxel", type=float, default=0.03)
-    parser.add_argument("--gate-fitness", "--gate_fitness", dest="gate_fitness", type=float, default=0.3)
-    parser.add_argument("--max-iter", "--max_iter", dest="max_iter", type=int, default=3)
-    parser.add_argument("--convergence-eps-rot", "--convergence_eps_rot", dest="convergence_eps_rot", type=float, default=1.0)
-    parser.add_argument("--convergence-eps-trans", "--convergence_eps_trans", dest="convergence_eps_trans", type=float, default=0.001)
-    parser.add_argument("--iterative-refine", action="store_true", help="启用迭代精炼 Gate-ICP")
+    parser.add_argument(
+        "--gate-fitness",
+        "--gate_fitness",
+        dest="gate_fitness",
+        type=float,
+        default=0.3,
+        help=(
+            "Gate-ICP 相对 complete 预测的 fitness 阈值。默认路径：未达阈值则 Final-ICP 回退 T_coarse。"
+            " 迭代精炼：首轮即达则立即结束 refine（不会在 OK 后再多跑 SNet）"
+        ),
+    )
+    parser.add_argument(
+        "--max-iter",
+        "--max_iter",
+        dest="max_iter",
+        type=int,
+        default=3,
+        help=(
+            "仅 --iterative-refine：normalize→SNet→Gate 的最大多轮次数（不是失败重试上限）。"
+            " 跑满未提前退出则 TIMEOUT"
+        ),
+    )
+    parser.add_argument(
+        "--convergence-eps-rot",
+        "--convergence_eps_rot",
+        dest="convergence_eps_rot",
+        type=float,
+        default=1.0,
+        help="仅迭代精炼：相邻轮相对位姿 dT 的旋转角阈值（度），与 --convergence-eps-trans 同时为真则可 CONVERGED 退出",
+    )
+    parser.add_argument(
+        "--convergence-eps-trans",
+        "--convergence_eps_trans",
+        dest="convergence_eps_trans",
+        type=float,
+        default=0.001,
+        help="仅迭代精炼：dT 的平移范数阈值（与 coarse 尺度一致的单位）",
+    )
+    parser.add_argument(
+        "--iterative-refine",
+        action="store_true",
+        help=(
+            "多轮 refine：每轮 T_current 下 normalize→SNet→Gate-ICP 得 t_next；"
+            "Gate OK 即停；FAIL 则 T←t_next 继续或达收敛/上限；"
+            "TIMEOUT 时 Final-ICP 用末次 t_next（非 T_coarse，也非历史最优 fitness）。"
+            "见模块 docstring"
+        ),
+    )
     parser.add_argument(
         "--input-resample",
         default="fps",
